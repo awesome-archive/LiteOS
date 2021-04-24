@@ -1,6 +1,8 @@
-/*----------------------------------------------------------------------------
- * Copyright (c) <2013-2017>, <Huawei Technologies Co., Ltd>
- * All rights reserved.
+/* ----------------------------------------------------------------------------
+ * Copyright (c) Huawei Technologies Co., Ltd. 2013-2019. All rights reserved.
+ * Description: LiteOS Mem Module Implementation
+ * Author: Huawei LiteOS Team
+ * Create: 2013-05-12
  * Redistribution and use in source and binary forms, with or without modification,
  * are permitted provided that the following conditions are met:
  * 1. Redistributions of source code must retain the above copyright notice, this list of
@@ -22,386 +24,311 @@
  * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *---------------------------------------------------------------------------*/
-/*----------------------------------------------------------------------------
- * Notice of Export Control Law
- * ===============================================
- * Huawei LiteOS may be subject to applicable export control laws and regulations, which might
- * include those applicable to Huawei LiteOS of U.S. and the country in which you are located.
- * Import, export and usage of Huawei LiteOS in any manner by you shall be in compliance with such
- * applicable export control laws and regulations.
- *---------------------------------------------------------------------------*/
-#include "string.h"
-#include "los_typedef.h"
-#include "los_memory.ph"
-#if (LOSCFG_KERNEL_MEM_SLAB == YES)
-#include "los_slab.ph"
-#endif
-#include "los_heap.ph"
+ * --------------------------------------------------------------------------- */
+
+#include "los_memory_pri.h"
+#include "los_memory_internal.h"
+
+#include "securec.h"
+
 #include "los_hwi.h"
 #if (LOSCFG_PLATFORM_EXC == YES)
-#include "los_exc.ph"
+#include "los_memcheck_pri.h"
 #endif
-#if (LOSCFG_PLATFORM_EXC == YES)
-#include "los_memcheck.ph"
-#endif
+#include "los_spinlock.h"
+#include "los_trace.h"
 
-#if (LOSCFG_MEM_MUL_POOL == YES)
-VOID *g_pPoolHead = NULL;
-#endif
+#ifdef __cplusplus
+#if __cplusplus
+extern "C" {
+#endif /* __cplusplus */
+#endif /* __cplusplus */
 
-#define OS_SLAB_CAST(_t, _exp) ((_t)(_exp))
-#define OS_MEM_POOL_BASE_ALIGN 4
-#define IS_POOL_ALIGNED(value, alignSize)  (0 == (((UINT32)(value)) & ((UINT32)(alignSize - 1))))
+#define POOL_ADDR_ALIGNSIZE 64
 
-LITE_OS_SEC_TEXT_MINOR VOID *osSlabCtrlHdrGet(VOID *pPool)
+LITE_OS_SEC_BSS  SPIN_LOCK_INIT(g_memSpin);
+
+UINT8 *m_aucSysMem0 = (UINT8 *)NULL;
+UINT8 *m_aucSysMem1 = (UINT8 *)NULL;
+__attribute__((section(".data.init"))) UINTPTR g_sys_mem_addr_end;
+__attribute__((section(".data.init"))) UINTPTR g_excInteractMemSize = 0;
+
+LITE_OS_SEC_TEXT_INIT UINT32 LOS_MemInit(VOID *pool, UINT32 size)
 {
-#if (LOSCFG_KERNEL_MEM_SLAB == YES)
-    return (&(OS_SLAB_CAST(struct LOS_HEAP_MANAGER *, pPool)->stSlabCtrlHdr));
-#else
-    return NULL;
-#endif
+    UINT32 ret = LOS_NOK;
+    UINT32 intSave;
+
+    if ((pool == NULL) || (size <= sizeof(struct LosHeapManager))) {
+        return ret;
+    }
+
+    MEM_LOCK(intSave);
+
+    if (OsMemMulPoolInit(pool, size) != LOS_OK) {
+        goto OUT;
+    }
+
+    if (OsHeapInit(pool, size) == FALSE) {
+        (VOID)OsMemMulPoolDeinit(pool);
+        goto OUT;
+    }
+
+    OsSlabMemInit(pool, size);
+
+    ret = LOS_OK;
+OUT:
+    MEM_UNLOCK(intSave);
+
+    LOS_TRACE(MEM_INFO_REQ, pool);
+    return ret;
 }
 
-/*****************************************************************************
- Function : LOS_MemInit
- Description : Initialize Dynamic Memory pool
- Input       : pPool    --- Pointer to memory pool
-               uwSize  --- Size of memory in bytes to allocate
- Output      : None
- Return      : LOS_OK - Ok, LOS_NOK - Error
-*****************************************************************************/
-LITE_OS_SEC_TEXT_INIT UINT32 LOS_MemInit(VOID *pPool, UINT32 uwSize)
+#ifdef LOSCFG_EXC_INTERACTION
+LITE_OS_SEC_TEXT_INIT UINT32 OsMemExcInteractionInit(UINTPTR memStart)
 {
-    BOOL bRet = TRUE;
-    UINTPTR uvIntSave;
-#if (LOSCFG_MEM_MUL_POOL == YES)
-    VOID *pNext = g_pPoolHead;
-    VOID * pCur = g_pPoolHead;
-    UINT32 uwPoolEnd;
-#endif
-
-    if (!pPool || uwSize <= sizeof(struct LOS_HEAP_MANAGER))
-        return LOS_NOK;
-
-    if (!IS_POOL_ALIGNED(pPool, OS_MEM_POOL_BASE_ALIGN))
-        return LOS_NOK;
-
-    uvIntSave = LOS_IntLock();
-
-#if (LOSCFG_MEM_MUL_POOL == YES)
-    while (pNext != NULL)
-    {
-        uwPoolEnd = (UINT32)pNext + ((struct LOS_HEAP_MANAGER *)pNext)->uwSize;
-        if ((pPool <= pNext && ((UINT32)pPool + uwSize) > (UINT32)pNext) ||
-            ((UINT32)pPool < uwPoolEnd && ((UINT32)pPool + uwSize) >= uwPoolEnd))
-        {
-            PRINT_ERR("pool [%p, 0x%x) conflict with pool [%p, 0x%x)\n",
-                          pPool, (UINT32)pPool + uwSize,
-                          pNext, (UINT32)pNext + ((struct LOS_HEAP_MANAGER *)pNext)->uwSize);
-
-            LOS_IntRestore(uvIntSave);
-            return LOS_NOK;
-        }
-        pCur = pNext;
-        pNext = ((struct LOS_HEAP_MANAGER *)pNext)->pNextPool;
-    }
-#endif
-
-    bRet = osHeapInit(pPool, uwSize);
-    if(!bRet)
-    {
-        LOS_IntRestore(uvIntSave);
-        return LOS_NOK;
-    }
-#if (LOSCFG_KERNEL_MEM_SLAB == YES)
-    if (uwSize >= SLAB_BASIC_NEED_SIZE)//if size of pool is small than size of slab need, don`t init slab
-    {
-        bRet = osSlabMemInit(pPool);
-        if(!bRet)
-        {
-            LOS_IntRestore(uvIntSave);
-            return LOS_NOK;
-        }
-    }
-#endif
-
-#if (LOSCFG_MEM_MUL_POOL == YES)
-    if (g_pPoolHead == NULL)
-    {
-        g_pPoolHead = pPool;
-    }
-    else
-    {
-        ((struct LOS_HEAP_MANAGER *)pCur)->pNextPool = pPool;
-    }
-
-    ((struct LOS_HEAP_MANAGER *)pPool)->pNextPool = NULL;
-#endif
-
-#if ((LOSCFG_PLATFORM_EXC == YES) && (LOSCFG_SAVE_EXC_INFO == YES))
-    osMemInfoUpdate(pPool, uwSize, MEM_MANG_MEMORY);
-#endif
-
-    LOS_IntRestore(uvIntSave);
-    return LOS_OK;
-}
-
-LITE_OS_SEC_TEXT_INIT UINT32 osMemSystemInit(VOID)
-{
-    UINT32 uwRet = LOS_OK;
-
-    uwRet = LOS_MemInit((VOID *)OS_SYS_MEM_ADDR, OS_SYS_MEM_SIZE);
-
-#if ((LOSCFG_PLATFORM_EXC == YES) && (LOSCFG_SAVE_EXC_INFO == YES))
-    osExcRegister(OS_EXC_TYPE_MEM, (EXC_INFO_SAVE_CALLBACK)LOS_MemExcInfoGet, g_aucMemMang);
-#endif
-    return uwRet;
-}
-
-#if (LOSCFG_MEM_MUL_POOL == YES)
-LITE_OS_SEC_TEXT_INIT UINT32 LOS_MemDeInit(VOID *pPool)
-{
-    UINTPTR uvIntSave, uvRet = LOS_NOK;
-    VOID *pNext, *pCur;
-
-    if (NULL == pPool)
-    {
-        return uvRet;
-    }
-    uvIntSave = LOS_IntLock();
-    do
-    {
-        if (pPool == g_pPoolHead)
-        {
-            g_pPoolHead = ((struct LOS_HEAP_MANAGER *)g_pPoolHead)->pNextPool;
-            uvRet = LOS_OK;
-            break;
-        }
-
-        pCur = g_pPoolHead;
-        pNext = g_pPoolHead;
-
-        while (pNext != NULL)
-        {
-            if (pPool == pNext)
-            {
-                ((struct LOS_HEAP_MANAGER *)pCur)->pNextPool = ((struct LOS_HEAP_MANAGER *)pNext)->pNextPool;
-                uvRet = LOS_OK;
-                break;
-            }
-            pCur = pNext;
-            pNext = ((struct LOS_HEAP_MANAGER *)pNext)->pNextPool;
-        }
-    }while(0);
-
-#if ((LOSCFG_PLATFORM_EXC == YES) && (LOSCFG_SAVE_EXC_INFO == YES))
-    if (uvRet == LOS_OK)
-        osMemInfoUpdate(pPool, 0, MEM_MANG_EMPTY);
-#endif
-#if (LOSCFG_KERNEL_MEM_SLAB == YES)
-    osSlabMemDeinit(pPool);
-#endif
-    LOS_IntRestore(uvIntSave);
-    return uvRet;
-}
-
-LITE_OS_SEC_TEXT_INIT UINT32 LOS_MemPoolList(VOID)
-{
-    VOID *pNext = g_pPoolHead;
-    UINT32 uwIndex = 0;
-
-    while (pNext != NULL)
-    {
-        uwIndex++;
-        osAlarmHeapInfo(pNext);
-        pNext = ((struct LOS_HEAP_MANAGER *)pNext)->pNextPool;
-    }
-    return uwIndex;
+    UINT32 ret;
+    m_aucSysMem0 = (UINT8 *)((memStart + (POOL_ADDR_ALIGNSIZE - 1)) & ~((UINTPTR)(POOL_ADDR_ALIGNSIZE - 1)));
+    g_excInteractMemSize = EXC_INTERACT_MEM_SIZE;
+    ret = LOS_MemInit(m_aucSysMem0, g_excInteractMemSize);
+    PRINT_INFO("LiteOS kernel exc interaction memory address:%p,size:0x%x\n", m_aucSysMem0, g_excInteractMemSize);
+    return ret;
 }
 #endif
 
-/*****************************************************************************
- Function : LOS_MemAlloc
- Description : Allocate Memory from Memory pool
- Input       : pPool    --- Pointer to memory pool
-               uwSize   --- Size of memory in bytes to allocate
- Output      : None
- Return      : Pointer to allocated memory
-*****************************************************************************/
-LITE_OS_SEC_TEXT VOID *LOS_MemAlloc (VOID *pPool, UINT32 uwSize)
+/*
+ * Description : Initialize Dynamic Memory pool
+ * Return      : LOS_OK on success or error code on failure
+ */
+LITE_OS_SEC_TEXT_INIT UINT32 OsMemSystemInit(UINTPTR memStart)
 {
-    VOID *pRet = NULL;
+    UINT32 ret;
+    UINT32 memSize;
 
-    if ((NULL == pPool) || (0 == uwSize))
-    {
-        return pRet;
-    }
-
-#if (LOSCFG_KERNEL_MEM_SLAB == YES)
-    pRet = osSlabMemAlloc(pPool, uwSize);
-    if(pRet == NULL)
+    m_aucSysMem1 = (UINT8 *)((memStart + (POOL_ADDR_ALIGNSIZE - 1)) & ~((UINTPTR)(POOL_ADDR_ALIGNSIZE - 1)));
+    memSize = OS_SYS_MEM_SIZE;
+    ret = LOS_MemInit((VOID *)m_aucSysMem1, memSize);
+#ifndef LOSCFG_EXC_INTERACTION
+    m_aucSysMem0 = m_aucSysMem1;
 #endif
-        pRet = osHeapAlloc(pPool, uwSize);
-
-    return pRet;
-}
-/*****************************************************************************
- Function : LOS_MemAllocAlign
- Description : align size then allocate node from Memory pool
- Input       : pPool        --- Pointer to memory pool
-               uwSize       --- Size of memory in bytes to allocate
-               uwBoundary   --- align form
- Output      : None
- Return      : Pointer to allocated memory node
-*****************************************************************************/
-LITE_OS_SEC_TEXT VOID *LOS_MemAllocAlign(VOID *pPool, UINT32 uwSize, UINT32 uwBoundary)
-{
-    return osHeapAllocAlign(pPool, uwSize, uwBoundary);
+    return ret;
 }
 
-/*****************************************************************************
- Function : LOS_MemRealloc
- Description : realloc memory from Memory pool
- Input       : pPool    --- Pointer to memory pool
-               pPtr     --- Pointer to memory
-               uwSize   --- new size
- Output      : None
- Return      : Pointer to allocated memory node
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR VOID *LOS_MemRealloc(VOID *pPool, VOID *pPtr, UINT32 uwSize)
+/*
+ * Description : print heap information
+ * Input       : pool --- Pointer to the manager, to distinguish heap
+ */
+VOID OsMemInfoPrint(const VOID *pool)
 {
-    VOID *p = NULL;
-    UINTPTR uvIntSave;
-    struct LOS_HEAP_NODE *pstNode;
-    UINT32 uwCpySize = 0;
-#if (LOSCFG_KERNEL_MEM_SLAB == YES)	
-    UINT32 uwOldSize = (UINT32)-1;
-#endif
-    UINT32 uwGapSize = 0;
+    struct LosHeapManager *heapMan = (struct LosHeapManager *)pool;
+    LosHeapStatus status = {0};
 
-    if ((int)uwSize < 0)
-    {
-        return NULL;
+    if (OsHeapStatisticsGet(heapMan, &status) == LOS_NOK) {
+        return;
     }
-    uvIntSave = LOS_IntLock();
+
+    PRINT_INFO("pool addr    pool size    used size    free size    max free    alloc Count    free Count\n");
+    PRINT_INFO("0x%-8x   0x%-8x   0x%-8x    0x%-8x   0x%-8x   0x%-8x     0x%-8x\n",
+               pool, heapMan->size, status.totalUsedSize, status.totalFreeSize, status.maxFreeNodeSize,
+               status.usedNodeNum, status.freeNodeNum);
+}
+
+LITE_OS_SEC_TEXT VOID *LOS_MemAlloc(VOID *pool, UINT32 size)
+{
+    VOID *ptr = NULL;
+    UINT32 intSave;
+
+    if ((pool == NULL) || (size == 0)) {
+        return ptr;
+    }
+
+    MEM_LOCK(intSave);
+
+    ptr = OsSlabMemAlloc(pool, size);
+    if (ptr == NULL) {
+        ptr = OsHeapAlloc(pool, size);
+    }
+
+    MEM_UNLOCK(intSave);
+
+    LOS_TRACE(MEM_ALLOC, pool, (UINTPTR)ptr, size);
+    return ptr;
+}
+
+LITE_OS_SEC_TEXT VOID *LOS_MemAllocAlign(VOID *pool, UINT32 size, UINT32 boundary)
+{
+    VOID *ptr = NULL;
+    UINT32 intSave;
+
+    MEM_LOCK(intSave);
+    ptr = OsHeapAllocAlign(pool, size, boundary);
+    MEM_UNLOCK(intSave);
+
+    LOS_TRACE(MEM_ALLOC_ALIGN, pool, (UINTPTR)ptr, size, boundary);
+    return ptr;
+}
+
+VOID *LOS_MemRealloc(VOID *pool, VOID *ptr, UINT32 size)
+{
+    VOID *retPtr = NULL;
+    VOID *freePtr = NULL;
+    UINT32 intSave;
+    struct LosHeapNode *node = NULL;
+    UINT32 cpySize;
+    UINT32 gapSize;
+    errno_t rc;
 
     /* Zero-size requests are treated as free. */
-    if ((NULL != pPtr) && (0 == uwSize))
-    {
-        (VOID)LOS_MemFree(pPool, pPtr);
-    }
-    /* Requests with NULL pointers are treated as malloc. */
-    else if (NULL == pPtr)
-    {
-        p = LOS_MemAlloc(pPool, uwSize);
-    }
-    else
-    {
-#if (LOSCFG_KERNEL_MEM_SLAB == YES)
-        uwOldSize = osSlabMemCheck(pPool, pPtr);
-        if (uwOldSize != (UINT32)-1)
-        {
-            uwCpySize = uwSize > uwOldSize ? uwOldSize : uwSize;
+    if ((ptr != NULL) && (size == 0)) {
+        if (LOS_MemFree(pool, ptr) != LOS_OK) {
+            PRINT_ERR("LOS_MemFree error, pool[%p], pPtr[%p]\n", pool, ptr);
         }
-        else
-#endif
-        {
+    } else if (ptr == NULL) { // Requests with NULL pointers are treated as malloc.
+        retPtr = LOS_MemAlloc(pool, size);
+    } else {
+        MEM_LOCK(intSave);
+
+        UINT32 oldSize = OsSlabMemCheck(pool, ptr);
+        if (oldSize != (UINT32)(-1)) {
+            cpySize = (size > oldSize) ? oldSize : size;
+        } else {
             /* find the real ptr through gap size */
-            uwGapSize = *((UINT32 *)((UINT32)pPtr - 4));
-            if (OS_MEM_GET_ALIGN_FLAG(uwGapSize))
-            {
+            gapSize = *((UINTPTR *)((UINTPTR)ptr - sizeof(UINTPTR)));
+            if (OS_MEM_GET_ALIGN_FLAG(gapSize)) {
+                MEM_UNLOCK(intSave);
                 return NULL;
             }
 
-            pstNode = ((struct LOS_HEAP_NODE *)pPtr) - 1;
-            uwCpySize = uwSize > pstNode->uwSize ? pstNode->uwSize : uwSize;
+            node = ((struct LosHeapNode *)ptr) - 1;
+            cpySize = (size > (node->size)) ? (node->size) : size;
         }
-        p = LOS_MemAlloc(pPool, uwSize);
 
-        if (p != NULL)
-        {
-            (VOID)memcpy(p, pPtr, uwCpySize);
-            (VOID)LOS_MemFree(pPool, pPtr);
+        MEM_UNLOCK(intSave);
+
+        retPtr = LOS_MemAlloc(pool, size);
+        if (retPtr != NULL) {
+            rc = memcpy_s(retPtr, size, ptr, cpySize);
+            if (rc == EOK) {
+                freePtr = ptr;
+            } else {
+                freePtr = retPtr;
+                retPtr = NULL;
+            }
+
+            if (LOS_MemFree(pool, freePtr) != LOS_OK) {
+                PRINT_ERR("LOS_MemFree error, pool[%p], ptr[%p]\n", pool, freePtr);
+            }
         }
     }
 
-    LOS_IntRestore(uvIntSave);
-    return p;
+    LOS_TRACE(MEM_REALLOC, pool, (UINTPTR)ptr, size);
+    return retPtr;
 }
 
-/*****************************************************************************
- Function : LOS_MemFree
- Description : Free Memory and return it to Memory pool
- Input       : pPool    --- Pointer to memory pool
-               pMem     --- Pointer to memory to free
- Output      : None
- Return      : LOS_OK - OK, LOS_NOK - Error
-*****************************************************************************/
-LITE_OS_SEC_TEXT UINT32 LOS_MemFree (VOID *pPool, VOID *pMem)
+LITE_OS_SEC_TEXT UINT32 LOS_MemFree(VOID *pool, VOID *mem)
 {
-    BOOL bRet = FALSE;
+    BOOL ret = FALSE;
+    UINT32 intSave;
 
-    if ((NULL == pPool) || (NULL == pMem))
-    {
+    if ((pool == NULL) || (mem == NULL)) {
         return LOS_NOK;
     }
 
-#if (LOSCFG_KERNEL_MEM_SLAB == YES)
-    bRet = osSlabMemFree(pPool, pMem);
-    if(bRet != TRUE)
-#endif
-        bRet = osHeapFree(pPool, pMem);
+    MEM_LOCK(intSave);
 
-    return (bRet == TRUE ? LOS_OK : LOS_NOK);
+    ret = OsSlabMemFree(pool, mem);
+    if (ret != TRUE) {
+        ret = OsHeapFree(pool, mem);
+    }
+
+    MEM_UNLOCK(intSave);
+
+    LOS_TRACE(MEM_FREE, pool, (UINTPTR)mem);
+    return (ret == TRUE ? LOS_OK : LOS_NOK);
 }
 
-LITE_OS_SEC_TEXT UINT32 LOS_MemStatisticsGet(VOID *pPool, LOS_MEM_STATUS *pstStatus)
+LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemInfoGet(VOID *pool, LOS_MEM_POOL_STATUS *status)
 {
-    LOS_HEAP_STATUS stHeapStatus;
-#if (LOSCFG_KERNEL_MEM_SLAB == YES)
-    LOS_SLAB_STATUS stSlabStatus;
-#endif
-    UINT32 uwErr;
+    LosHeapStatus heapStatus;
+    UINT32 err;
+    UINT32 intSave;
 
-    uwErr = osHeapStatisticsGet(pPool, &stHeapStatus);
-    if (uwErr != LOS_OK)
-    {
+    if ((pool == NULL) || (status == NULL)) {
         return LOS_NOK;
     }
 
-    pstStatus->totalSize  = stHeapStatus.totalSize;
-    pstStatus->usedSize   = stHeapStatus.usedSize;
-    pstStatus->freeSize   = stHeapStatus.freeSize;
-    pstStatus->allocCount = stHeapStatus.allocCount;
-    pstStatus->freeCount  = stHeapStatus.freeCount;
+    MEM_LOCK(intSave);
 
-#if (LOSCFG_KERNEL_MEM_SLAB == YES)
-    uwErr = osSlabStatisticsGet(pPool, &stSlabStatus);
-    if (uwErr != LOS_OK)
-    {
+    err = OsHeapStatisticsGet(pool, &heapStatus);
+    if (err != LOS_OK) {
+        MEM_UNLOCK(intSave);
         return LOS_NOK;
     }
 
-    pstStatus->totalSize  = stHeapStatus.totalSize;
-    pstStatus->usedSize   = stHeapStatus.usedSize - stSlabStatus.freeSize;  //all slab region inside of heap used region
-    pstStatus->freeSize   = stHeapStatus.freeSize + stSlabStatus.freeSize;
-    pstStatus->allocCount = stHeapStatus.allocCount + stSlabStatus.allocCount;
-    pstStatus->freeCount  = stHeapStatus.freeCount + stSlabStatus.freeCount;
+    status->uwTotalUsedSize   = heapStatus.totalUsedSize;
+    status->uwTotalFreeSize   = heapStatus.totalFreeSize;
+    status->uwMaxFreeNodeSize = heapStatus.maxFreeNodeSize;
+    status->uwUsedNodeNum  = heapStatus.usedNodeNum;
+    status->uwFreeNodeNum  = heapStatus.freeNodeNum;
+
+#ifdef LOSCFG_MEM_TASK_STAT
+    status->uwUsageWaterLine = heapStatus.usageWaterLine;
 #endif
+
+    MEM_UNLOCK(intSave);
     return LOS_OK;
 }
 
-LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemGetMaxFreeBlkSize(VOID *pPool)
+LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemTotalUsedGet(VOID *pool)
 {
-    UINT32 uwMaxFreeSize = osHeapGetMaxFreeBlkSize(pPool);
-    UINT32 uwMaxSlabFreeSize = 0;
-#if (LOSCFG_KERNEL_MEM_SLAB == YES)
-    uwMaxSlabFreeSize = osSlabGetMaxFreeBlkSize(pPool);
-#endif
+    LosHeapStatus heapStatus;
+    UINT32 err;
+    UINT32 intSave;
 
-#ifndef MAX
-#define MAX(x,y) (x)>(y)?(x):(y)
-#endif
-    return MAX(uwMaxFreeSize, uwMaxSlabFreeSize);
+    if (pool == NULL) {
+        return OS_NULL_INT;
+    }
+
+    MEM_LOCK(intSave);
+    err = OsHeapStatisticsGet(pool, &heapStatus);
+    MEM_UNLOCK(intSave);
+
+    if (err != LOS_OK) {
+        return OS_NULL_INT;
+    }
+
+    return heapStatus.totalUsedSize;
 }
+
+LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemPoolSizeGet(const VOID *pool)
+{
+    struct LosHeapManager *heapManager = NULL;
+
+    if (pool == NULL) {
+        return OS_NULL_INT;
+    }
+
+    heapManager = (struct LosHeapManager *)pool;
+    return heapManager->size;
+}
+
+LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemIntegrityCheck(VOID *pool)
+{
+    UINT32 intSave;
+    UINT32 ret;
+
+    if (pool == NULL) {
+        return OS_NULL_INT;
+    }
+
+    MEM_LOCK(intSave);
+    ret = OsHeapIntegrityCheck(pool);
+    MEM_UNLOCK(intSave);
+
+    return ret;
+}
+
+#ifdef __cplusplus
+#if __cplusplus
+}
+#endif /* __cplusplus */
+#endif /* __cplusplus */

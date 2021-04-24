@@ -1,6 +1,8 @@
 /*----------------------------------------------------------------------------
- * Copyright (c) <2016-2018>, <Huawei Technologies Co., Ltd>
- * All rights reserved.
+ * Copyright (c) <2013-2020>, <Huawei Technologies Co., Ltd>
+ * Description: Lwip Port CC HeadFile
+ * Author: Huawei LiteOS Team
+ * Create: 2013-01-01
  * Redistribution and use in source and binary forms, with or without modification,
  * are permitted provided that the following conditions are met:
  * 1. Redistributions of source code must retain the above copyright notice, this list of
@@ -22,15 +24,7 @@
  * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *---------------------------------------------------------------------------*/
-/*----------------------------------------------------------------------------
- * Notice of Export Control Law
- * ===============================================
- * Huawei LiteOS may be subject to applicable export control laws and regulations, which might
- * include those applicable to Huawei LiteOS of U.S. and the country in which you are located.
- * Import, export and usage of Huawei LiteOS in any manner by you shall be in compliance with such
- * applicable export control laws and regulations.
- *---------------------------------------------------------------------------*/
+ * --------------------------------------------------------------------------- */
 
 /*
  * Copyright (c) 2001-2003 Swedish Institute of Computer Science.
@@ -68,30 +62,12 @@
 
 #include "cpu.h"
 
-typedef unsigned   char    u8_t;
-typedef signed     char    s8_t;
-typedef unsigned   short   u16_t;
-typedef signed     short   s16_t;
-typedef unsigned   long    u32_t;
-typedef signed     long    s32_t;
-typedef u32_t mem_ptr_t;
-//typedef int sys_prot_t;
-
-//#define U16_F "hu"
-//#define S16_F "d"
-//#define X16_F "hx"
-//#define U32_F "u"
-//#define S32_F "d"
-//#define X32_F "x"
-//#define SZT_F "uz"
-
 #define U16_F "4d"
 #define S16_F "4d"
 #define X16_F "4x"
 #define U32_F "8ld"
 #define S32_F "8ld"
 #define X32_F "8lx"
-
 
 /* define compiler specific symbols */
 #if defined (__ICCARM__)
@@ -125,8 +101,9 @@ typedef u32_t mem_ptr_t;
 
 #endif
 
-#include <stdio.h>  //use the printf
+#include <stdio.h>  // use the printf
 #include <stdlib.h>
+
 
 #define LWIP_RAND() ((u32_t)rand())
 #define LWIP_PLATFORM_DIAG(x)  {printf x;}
@@ -136,6 +113,6 @@ typedef u32_t mem_ptr_t;
 
 #define LWIP_ERROR(message, expression, handler) do { if (!(expression)) { \
   printf("Assertion \"%s\" failed at line %d in %s\n", message, \
-    __LINE__, __FILE__); fflush(NULL);handler;} } while(0)
+    __LINE__, __FILE__); handler;} } while(0)
 
 #endif /* __CC_H__ */

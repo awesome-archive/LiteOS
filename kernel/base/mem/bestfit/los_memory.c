@@ -1,6 +1,8 @@
-/*----------------------------------------------------------------------------
- * Copyright (c) <2013-2015>, <Huawei Technologies Co., Ltd>
- * All rights reserved.
+/* ----------------------------------------------------------------------------
+ * Copyright (c) Huawei Technologies Co., Ltd. 2013-2019. All rights reserved.
+ * Description: LiteOS Mem Module Implementation
+ * Author: Huawei LiteOS Team
+ * Create: 2013-01-01
  * Redistribution and use in source and binary forms, with or without modification,
  * are permitted provided that the following conditions are met:
  * 1. Redistributions of source code must retain the above copyright notice, this list of
@@ -22,30 +24,29 @@
  * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *---------------------------------------------------------------------------*/
-/*----------------------------------------------------------------------------
- * Notice of Export Control Law
- * ===============================================
- * Huawei LiteOS may be subject to applicable export control laws and regulations, which might
- * include those applicable to Huawei LiteOS of U.S. and the country in which you are located.
- * Import, export and usage of Huawei LiteOS in any manner by you shall be in compliance with such
- * applicable export control laws and regulations.
- *---------------------------------------------------------------------------*/
+ * --------------------------------------------------------------------------- */
 
-/*ISP_LINT*/
-/*lint -e7
- -esym(7,*)*/
-/*lint -e826 -e834 -e835 -e845 -e838
- -esym(826,*) -esym(834,*) -esym(835,*) -esym(845,*) -esym(838,*)*/
-#include "string.h"
-#include "los_memory.h"
-#include "los_memory.inc"
-#include "los_task.ph"
-#include "los_exc.h"
+#include "los_memory_internal.h"
+#include "los_memory_pri.h"
 
-#if (LOSCFG_MEM_TASK_USED_STATISTICS == YES)
-#include "los_memstat.inc"
+#ifdef LOSCFG_LIB_LIBC
+#include "stdio.h"
 #endif
+#include "los_multipledlinkhead_pri.h"
+#include "los_slab_pri.h"
+#ifdef LOSCFG_MEM_RECORDINFO
+#include "los_memrecord_pri.h"
+#endif
+#include "los_task_pri.h"
+#include "los_exc.h"
+#include "los_spinlock.h"
+#include "los_trace.h"
+
+#ifdef LOSCFG_SHELL_EXCINFO_DUMP
+#include "los_exc_pri.h"
+#endif
+
+#include "los_lms_pri.h"
 
 #ifdef __cplusplus
 #if __cplusplus
@@ -53,1288 +54,2406 @@ extern "C" {
 #endif /* __cplusplus */
 #endif /* __cplusplus */
 
-/**
- * @ingroup los_memory
- * Memory linked list node structure
- */
-typedef struct tagLOS_MEM_DYN_NODE
-{
-    LOS_DL_LIST stFreeNodeInfo;             /**<Free memory node  */
-    struct tagLOS_MEM_DYN_NODE *pstPreNode;    /**<Pointer to the previous memory node*/
-    UINT32 uwSizeAndFlag;                   /**<Size and flag of the current node (the highest bit represents a flag, and the rest bits specify the size)*/
-}LOS_MEM_DYN_NODE;
+#define NODEDUMPSIZE  64  /* the dump size of current broken node when memcheck error */
+#define COLUMN_NUM    8   /* column num of the output info of mem node */
 
-/**
- * @ingroup los_memory
- * Memory pool information structure
- */
-typedef struct tagLOS_MEM_POOL_INFO
-{
-    VOID *pPoolAddr;                        /**<Starting address of a memory pool  */
-    UINT32 uwPoolSize;                      /**<Memory pool size    */
-} LOS_MEM_POOL_INFO;
+#define OS_CHECK_NULL_RETURN(param) do {              \
+    if ((param) == NULL) {                            \
+        PRINT_ERR("%s %d\n", __FUNCTION__, __LINE__); \
+        return;                                       \
+    }                                                 \
+} while (0)
 
-extern VOID print_hex(unsigned int *ptr, unsigned int num);
+/* spinlock for mem module, only available on SMP mode */
+LITE_OS_SEC_BSS  SPIN_LOCK_INIT(g_memSpin);
 
-extern UINT8 *m_aucSysMem0;
-LITE_OS_SEC_TEXT_INIT UINT32 osMemSystemInit()
-{
-    UINT32 uwRet;
-    UINT32 uwMemSize;
+UINT8 *m_aucSysMem0 = NULL;
+UINT8 *m_aucSysMem1 = NULL;
 
-    m_aucSysMem0 = (UINT8 *)(((UINT32)m_aucSysMem0 + (64 - 1)) & ~(64 - 1));
-    uwMemSize = g_sys_mem_addr_end  - OS_SYS_NOCACHEMEM_SIZE - (UINT32)m_aucSysMem0;
-    PRINT_INFO("LiteOS heap memory address:0x%x,size:0x%x\n",m_aucSysMem0,uwMemSize);
-    uwRet = LOS_MemInit(m_aucSysMem0, uwMemSize);
-    return uwRet;
-}
+MALLOC_HOOK g_MALLOC_HOOK = NULL;
 
-#if OS_SYS_NOCACHEMEM_SIZE
-extern UINT8 *m_aucSysNoCacheMem0;
-LITE_OS_SEC_TEXT_INIT UINT32 osNocacheMemSystemInit(VOID)
-{
-    UINT32 uwRet;
-    m_aucSysNoCacheMem0 = (g_sys_mem_addr_end - OS_SYS_NOCACHEMEM_SIZE);
-    uwRet = LOS_MemInit(m_aucSysNoCacheMem0, OS_SYS_NOCACHEMEM_SIZE);
-    return uwRet;
-}
+__attribute__((section(".data.init"))) UINTPTR g_sys_mem_addr_end;
+__attribute__((section(".data.init"))) UINTPTR g_excInteractMemSize = 0;
+
+#ifdef LOSCFG_BASE_MEM_NODE_SIZE_CHECK
+STATIC UINT8 g_memCheckLevel = LOS_MEM_CHECK_LEVEL_DEFAULT;
 #endif
 
-LITE_OS_SEC_DATA_INIT MALLOC_HOOK g_MALLOC_HOOK = (MALLOC_HOOK)NULL; /*lint !e611*/
-
-VOID *osMemFindNodeCtrl(VOID *pPtr);
-#ifdef OS_MEM_CHECK_DEBUG
-LITE_OS_SEC_DATA static UINT8 ucCheckMemLevel = (UINT8)LOS_MEM_CHECK_LEVEL_DEFAULT;
+#ifdef LOSCFG_MEM_MUL_MODULE
+UINT32 g_moduleMemUsedSize[MEM_MODULE_MAX + 1] = { 0 };
 #endif
 
-LITE_OS_SEC_TEXT_MINOR VOID LOS_MemFreeNodeCheck(VOID *pPool, LOS_MEM_DYN_NODE *pstNode)
-{
-    LOS_DL_LIST *pstListHead = (LOS_DL_LIST *)NULL;
-    LOS_MULTIPLE_DLNK_HEAD *pstHeadAddr = (LOS_MULTIPLE_DLNK_HEAD *)((UINT32)pPool + sizeof(LOS_MEM_POOL_INFO));
-    UINT32 uwSized = pstNode->uwSizeAndFlag & 0x3fffffff;
-    UINT32 uwIdx = (UINT32)(31 - __builtin_clz(uwSized) - OS_MIN_MULTI_DLNK_LOG2);
-    LOS_TASK_CB *pstTaskCB;
-    UINT32 uwTaskID;
-    UINT32 uwflag = 0;
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+STATIC VOID OsMemNodeSave(LosMemDynNode *node);
+#endif
 
-    if (OS_MEM_NODE_GET_USED_FLAG(pstNode->uwSizeAndFlag))
+STATIC VOID *OsMemAllocWithCheck(LosMemPoolInfo *pool, UINT32 size);
+
+STATIC INLINE VOID OS_MEM_TASKID_SET(LosMemDynNode *node, UINT32 taskId)
+{
+    node->selfNode.taskId = taskId;
+
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+    OsMemNodeSave(node);
+#endif
+}
+
+STATIC INLINE UINT32 OS_MEM_TASKID_GET(const LosMemDynNode *node)
+{
+    return (UINT32)node->selfNode.taskId;
+}
+
+#ifdef LOSCFG_MEM_MUL_MODULE
+
+STATIC INLINE VOID OS_MEM_MODID_SET(LosMemDynNode *node, UINT32 moduleId)
+{
+    node->selfNode.moduleId = moduleId;
+
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+    OsMemNodeSave(node);
+#endif
+}
+
+STATIC INLINE UINT32 OS_MEM_MODID_GET(const LosMemDynNode *node)
+{
+    return (UINT32)node->selfNode.moduleId;
+}
+
+#endif
+
+/*
+ * Description : set magic & taskid
+ * Input       : node -- the node which will be set magic & taskid
+ */
+STATIC INLINE VOID OsMemSetMagicNumAndTaskID(LosMemDynNode *node)
+{
+#if defined(LOSCFG_MEM_DEBUG) || defined(LOSCFG_MEM_TASK_STAT)
+    LosTaskCB *runTask = OsCurrTaskGet();
+
+    OS_MEM_SET_MAGIC(node->selfNode.magic);
+
+    /*
+     * If the operation occurred before task initialization(runTask was not assigned)
+     * or in interrupt, make the value of taskid of node to  (TASK_NUM - 1) which is
+     * the id of the extra task. We can record those memory use with that.
+     */
+    if ((runTask != NULL) && OS_INT_INACTIVE) {
+        OS_MEM_TASKID_SET(node, runTask->taskId);
+    } else {
+        /* If the task mode does not initialize, the field is the 0xffffffff */
+        OS_MEM_TASKID_SET(node, TASK_NUM - 1);
+    }
+#endif
+}
+
+#ifdef LOSCFG_BASE_MEM_NODE_SIZE_CHECK
+const VOID *OsMemFindNodeCtrl(const VOID *pool, const VOID *ptr);
+#endif
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+#define CHECKSUM_MAGICNUM    0xDEADBEEF
+#define OS_MEM_NODE_CHECKSUM_CALCULATE(ctlNode)    \
+    (((UINTPTR)(ctlNode)->freeNodeInfo.pstPrev) ^  \
+    ((UINTPTR)(ctlNode)->freeNodeInfo.pstNext) ^   \
+    ((UINTPTR)(ctlNode)->preNode) ^                \
+    (ctlNode)->gapSize ^                           \
+    (ctlNode)->sizeAndFlag ^                       \
+    CHECKSUM_MAGICNUM)
+
+STATIC INLINE VOID OsMemDispCtlNode(const LosMemCtlNode *ctlNode)
+{
+    UINTPTR checksum;
+
+    checksum = OS_MEM_NODE_CHECKSUM_CALCULATE(ctlNode);
+
+    PRINTK("node:%p checksum=%p[%p] freeNodeInfo.pstPrev=%p "
+           "freeNodeInfo.pstNext=%p preNode=%p gapSize=0x%x sizeAndFlag=0x%x\n",
+           ctlNode,
+           ctlNode->checksum,
+           checksum,
+           ctlNode->freeNodeInfo.pstPrev,
+           ctlNode->freeNodeInfo.pstNext,
+           ctlNode->preNode,
+           ctlNode->gapSize,
+           ctlNode->sizeAndFlag);
+}
+
+STATIC INLINE VOID OsMemDispMoreDetails(const LosMemDynNode *node)
+{
+    UINT32 taskId;
+    LosTaskCB *taskCB = NULL;
+
+    PRINT_ERR("************************************************\n");
+    OsMemDispCtlNode(&node->selfNode);
+    PRINT_ERR("the address of node :%p\n", node);
+
+    if (!OS_MEM_NODE_GET_USED_FLAG(node->selfNode.sizeAndFlag)) {
+        PRINT_ERR("this is a FREE node\n");
+        PRINT_ERR("************************************************\n\n");
         return;
-    pstListHead = pstHeadAddr->stListHead[uwIdx].pstNext;
-    if (pstListHead == pstNode->stFreeNodeInfo.pstPrev)
-        uwflag = 1;
-    while (pstListHead != &(pstHeadAddr->stListHead[uwIdx]) && (uwflag == 0))
-    {
-        pstListHead = pstListHead->pstNext;
-        if (pstListHead == pstNode->stFreeNodeInfo.pstPrev)
-        {
-            uwflag = 1;
-        }
     }
 
-    if (uwflag == 0)
-    {
-        uwTaskID = (UINT32)(pstNode->pstPreNode->stFreeNodeInfo.pstNext);
-        if (uwTaskID >= g_uwTskMaxNum)
-        {
-        LOS_Panic("///////[LOS_MemFreeNodeCheck] Task ID %d in pre node is invalid!////////\n", uwTaskID);
+    taskId = OS_MEM_TASKID_GET(node);
+    if (taskId >= g_taskMaxNum) {
+        PRINT_ERR("The task [ID: 0x%x] is ILLEGAL\n", taskId);
+        if (taskId == g_taskMaxNum) {
+            PRINT_ERR("PROBABLY alloc by SYSTEM INIT, NOT IN ANY TASK\n");
         }
-        pstTaskCB = OS_TCB_FROM_TID(uwTaskID);
+        PRINT_ERR("************************************************\n\n");
+        return;
+    }
 
-        if ((pstTaskCB->usTaskStatus & OS_TASK_STATUS_UNUSED) ||
-            (pstTaskCB->pfnTaskEntry == NULL) ||
-            (pstTaskCB->pcTaskName == NULL))
-        {
-            LOS_Panic("\r\n[LOS_MemFreeNodeCheck] Task ID %d in pre node  is not created!\n", uwTaskID);
-        }
-        LOS_Panic("[LOS_MemFreeNodeCheck] cur node: 0x%x\n"
-                   "pre node: 0x%x\n"
-                   "pre node was allocated by task:%s\n",
-                   pstNode, pstNode->pstPreNode,  pstTaskCB->pcTaskName);/*lint !e515 !e516*/
+    taskCB = OS_TCB_FROM_TID(taskId);
+    if ((taskCB->taskStatus & OS_TASK_STATUS_UNUSED) ||
+        (taskCB->taskEntry == NULL) ||
+        (taskCB->taskName == NULL)) {
+        PRINT_ERR("The task [ID: 0x%x] is NOT CREATED(ILLEGAL)\n", taskId);
+        PRINT_ERR("************************************************\n\n");
+        return;
+    }
+
+    PRINT_ERR("allocated by task: %s [ID = 0x%x]\n", taskCB->taskName, taskId);
+#ifdef LOSCFG_MEM_MUL_MODULE
+    PRINT_ERR("allocated by moduleId: %lu\n", OS_MEM_MODID_GET(node));
+#endif
+
+    PRINT_ERR("************************************************\n\n");
+}
+
+STATIC INLINE VOID OsMemDispWildPointerMsg(const LosMemDynNode *node, const VOID *ptr)
+{
+    PRINT_ERR("*****************************************************\n");
+    PRINT_ERR("find a control block at: %p, gap size: 0x%x, sizeof(LosMemDynNode): 0x%x\n", node,
+              node->selfNode.gapSize, sizeof(LosMemDynNode));
+    PRINT_ERR("the pointer should be: %p\n",
+              ((UINTPTR)node + node->selfNode.gapSize + sizeof(LosMemDynNode)));
+    PRINT_ERR("the pointer given is: %p\n", ptr);
+    PRINT_ERR("PROBABLY A WILD POINTER\n");
+    OsBackTrace();
+    PRINT_ERR("*****************************************************\n\n");
+}
+
+STATIC INLINE VOID OsMemChecksumSet(LosMemCtlNode *ctlNode)
+{
+    ctlNode->checksum = OS_MEM_NODE_CHECKSUM_CALCULATE(ctlNode);
+}
+
+STATIC INLINE BOOL OsMemChecksumVerify(const LosMemCtlNode *ctlNode)
+{
+    return ctlNode->checksum == OS_MEM_NODE_CHECKSUM_CALCULATE(ctlNode);
+}
+
+STATIC INLINE VOID OsMemBackupSetup(const LosMemDynNode *node)
+{
+    LosMemDynNode *nodePre = node->selfNode.preNode;
+    if (nodePre != NULL) {
+        nodePre->backupNode.freeNodeInfo.pstNext = node->selfNode.freeNodeInfo.pstNext;
+        nodePre->backupNode.freeNodeInfo.pstPrev = node->selfNode.freeNodeInfo.pstPrev;
+        nodePre->backupNode.preNode = node->selfNode.preNode;
+        nodePre->backupNode.checksum = node->selfNode.checksum;
+        nodePre->backupNode.gapSize = node->selfNode.gapSize;
+#ifdef LOSCFG_MEM_RECORDINFO
+        nodePre->backupNode.originSize = node->selfNode.originSize;
+#endif
+        nodePre->backupNode.sizeAndFlag = node->selfNode.sizeAndFlag;
     }
 }
 
-/*****************************************************************************
- Function : osMemFindSuitableFreeBlock
- Description : find suitable free block use "best fit" algorithm
- Input       : pPool    --- Pointer to memory pool
-                 uwAllocSize  --- Size of memory in bytes which note need allocate
- Output      : None
- Return      :NULL--no suitable block found
-                 pstTem--pointer a suitable free block
-*****************************************************************************/
-LITE_OS_SEC_ALW_INLINE STATIC_INLINE LOS_MEM_DYN_NODE *osMemFindSuitableFreeBlock(VOID *pPool, UINT32 uwAllocSize)
+LosMemDynNode *OsMemNodeNextGet(const VOID *pool, const LosMemDynNode *node)
 {
-    LOS_DL_LIST *pstListHead = (LOS_DL_LIST *)NULL;
+    const LosMemPoolInfo *poolInfo = (const LosMemPoolInfo *)pool;
 
-    for (pstListHead = OS_MEM_HEAD(pPool, uwAllocSize); pstListHead != NULL; pstListHead = LOS_DLnkNextMultiHead(OS_MEM_HEAD_ADDR(pPool), pstListHead))
-    {
-        LOS_MEM_DYN_NODE *pstTmp = (LOS_MEM_DYN_NODE *)NULL;
-        LOS_DL_LIST_FOR_EACH_ENTRY(pstTmp, pstListHead, LOS_MEM_DYN_NODE, stFreeNodeInfo) /*lint !e413*/
-        {
-            if (pstTmp->uwSizeAndFlag >= uwAllocSize)
-            {
-                return pstTmp;
+    if (node == OS_MEM_END_NODE(pool, poolInfo->poolSize)) {
+        return OS_MEM_FIRST_NODE(pool);
+    } else {
+        return OS_MEM_NEXT_NODE(node);
+    }
+}
+
+STATIC INLINE UINT32 OsMemBackupSetup4Next(const VOID *pool, LosMemDynNode *node)
+{
+    LosMemDynNode *nodeNext = OsMemNodeNextGet(pool, node);
+
+    if (!OsMemChecksumVerify(&nodeNext->selfNode)) {
+        PRINT_ERR("[%s]the next node is broken!!\n", __FUNCTION__);
+        OsMemDispCtlNode(&(nodeNext->selfNode));
+        PRINT_ERR("Current node details:\n");
+        OsMemDispMoreDetails(node);
+
+        return LOS_NOK;
+    }
+
+    if (!OsMemChecksumVerify(&node->backupNode)) {
+        node->backupNode.freeNodeInfo.pstNext = nodeNext->selfNode.freeNodeInfo.pstNext;
+        node->backupNode.freeNodeInfo.pstPrev = nodeNext->selfNode.freeNodeInfo.pstPrev;
+        node->backupNode.preNode = nodeNext->selfNode.preNode;
+        node->backupNode.checksum = nodeNext->selfNode.checksum;
+        node->backupNode.gapSize = nodeNext->selfNode.gapSize;
+#ifdef LOSCFG_MEM_RECORDINFO
+        node->backupNode.originSize = nodeNext->selfNode.originSize;
+#endif
+        node->backupNode.sizeAndFlag = nodeNext->selfNode.sizeAndFlag;
+    }
+    return LOS_OK;
+}
+
+UINT32 OsMemBackupDoRestore(VOID *pool, const LosMemDynNode *nodePre, LosMemDynNode *node)
+{
+    if (node == NULL) {
+        PRINT_ERR("the node is NULL.\n");
+        return LOS_NOK;
+    }
+    PRINT_ERR("the backup node information of current node in previous node:\n");
+    OsMemDispCtlNode(&nodePre->backupNode);
+    PRINT_ERR("the detailed information of previous node:\n");
+    OsMemDispMoreDetails(nodePre);
+
+    node->selfNode.freeNodeInfo.pstNext = nodePre->backupNode.freeNodeInfo.pstNext;
+    node->selfNode.freeNodeInfo.pstPrev = nodePre->backupNode.freeNodeInfo.pstPrev;
+    node->selfNode.preNode = nodePre->backupNode.preNode;
+    node->selfNode.checksum = nodePre->backupNode.checksum;
+    node->selfNode.gapSize = nodePre->backupNode.gapSize;
+#ifdef LOSCFG_MEM_RECORDINFO
+    node->selfNode.originSize = nodePre->backupNode.originSize;
+#endif
+    node->selfNode.sizeAndFlag = nodePre->backupNode.sizeAndFlag;
+
+    /* we should re-setup next node's backup on current node */
+    return OsMemBackupSetup4Next(pool, node);
+}
+
+STATIC LosMemDynNode *OsMemFirstNodePrevGet(const LosMemPoolInfo *poolInfo)
+{
+    LosMemDynNode *nodePre = NULL;
+
+    nodePre = OS_MEM_END_NODE(poolInfo, poolInfo->poolSize);
+    if (!OsMemChecksumVerify(&(nodePre->selfNode))) {
+        PRINT_ERR("the current node is THE FIRST NODE !\n");
+        PRINT_ERR("[%s]: the node information of previous node is bad !!\n", __FUNCTION__);
+        OsMemDispCtlNode(&(nodePre->selfNode));
+    }
+    if (!OsMemChecksumVerify(&(nodePre->backupNode))) {
+        PRINT_ERR("the current node is THE FIRST NODE !\n");
+        PRINT_ERR("[%s]: the backup node information of current node in previous Node is bad !!\n", __FUNCTION__);
+        OsMemDispCtlNode(&(nodePre->backupNode));
+        return NULL;
+    }
+
+    return nodePre;
+}
+
+LosMemDynNode *OsMemNodePrevGet(VOID *pool, const LosMemDynNode *node)
+{
+    LosMemDynNode *nodeCur = NULL;
+    LosMemDynNode *nodePre = NULL;
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)pool;
+
+    if (node == OS_MEM_FIRST_NODE(pool)) {
+        return OsMemFirstNodePrevGet(poolInfo);
+    }
+
+    for (nodeCur = OS_MEM_FIRST_NODE(pool);
+         nodeCur < OS_MEM_END_NODE(pool, poolInfo->poolSize);
+         nodeCur = OS_MEM_NEXT_NODE(nodeCur)) {
+        if (!OsMemChecksumVerify(&(nodeCur->selfNode))) {
+            PRINT_ERR("[%s]: the node information of current node is bad !!\n", __FUNCTION__);
+            OsMemDispCtlNode(&(nodeCur->selfNode));
+
+            if (nodePre == NULL) {
+                return NULL;
+            }
+
+            PRINT_ERR("the detailed information of previous node:\n");
+            OsMemDispMoreDetails(nodePre);
+
+            /* due to the every step's checksum verify, nodePre is trustful */
+            if (OsMemBackupDoRestore(pool, nodePre, nodeCur) != LOS_OK) {
+                return NULL;
+            }
+        }
+
+        if (!OsMemChecksumVerify(&(nodeCur->backupNode))) {
+            PRINT_ERR("[%s]: the backup node information in current node is bad !!\n", __FUNCTION__);
+            OsMemDispCtlNode(&(nodeCur->backupNode));
+
+            if (nodePre != NULL) {
+                PRINT_ERR("the detailed information of previous node:\n");
+                OsMemDispMoreDetails(nodePre);
+            }
+
+            if (OsMemBackupSetup4Next(pool, nodeCur) != LOS_OK) {
+                return NULL;
+            }
+        }
+
+        if (OS_MEM_NEXT_NODE(nodeCur) == node) {
+            return nodeCur;
+        }
+
+        if (OS_MEM_NEXT_NODE(nodeCur) > node) {
+            break;
+        }
+
+        nodePre = nodeCur;
+    }
+
+    return NULL;
+}
+
+LosMemDynNode *OsMemNodePrevTryGet(VOID *pool, LosMemDynNode **node, const VOID *ptr)
+{
+    UINTPTR nodeShouldBe;
+    LosMemDynNode *nodeCur = NULL;
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)pool;
+    LosMemDynNode *nodePre = OS_MEM_END_NODE(pool, poolInfo->poolSize);
+
+    for (nodeCur = OS_MEM_FIRST_NODE(pool);
+         nodeCur < OS_MEM_END_NODE(pool, poolInfo->poolSize);
+         nodeCur = OS_MEM_NEXT_NODE(nodeCur)) {
+        if (!OsMemChecksumVerify(&(nodeCur->selfNode))) {
+            PRINT_ERR("[%s]: the node information of current node is bad !!\n", __FUNCTION__);
+            OsMemDispCtlNode(&(nodeCur->selfNode));
+
+            PRINT_ERR("the detailed information of previous node:\n");
+            OsMemDispMoreDetails(nodePre);
+
+            /* due to the every step's checksum verify, nodePre is trustful */
+            if (OsMemBackupDoRestore(pool, nodePre, nodeCur) != LOS_OK) {
+                return NULL;
+            }
+        }
+
+        if (!OsMemChecksumVerify(&(nodeCur->backupNode))) {
+            PRINT_ERR("[%s]: the backup node information in current node is bad !!\n", __FUNCTION__);
+            OsMemDispCtlNode(&(nodeCur->backupNode));
+
+            if (nodePre != NULL) {
+                PRINT_ERR("the detailed information of previous node:\n");
+                OsMemDispMoreDetails(nodePre);
+            }
+
+            if (OsMemBackupSetup4Next(pool, nodeCur) != LOS_OK) {
+                return NULL;
+            }
+        }
+
+        nodeShouldBe = (UINTPTR)nodeCur + nodeCur->selfNode.gapSize + sizeof(LosMemDynNode);
+        if (nodeShouldBe == (UINTPTR)ptr) {
+            *node = nodeCur;
+            return nodePre;
+        }
+
+        if (OS_MEM_NEXT_NODE(nodeCur) > (LosMemDynNode *)ptr) {
+            OsMemDispWildPointerMsg(nodeCur, ptr);
+            break;
+        }
+
+        nodePre = nodeCur;
+    }
+
+    return NULL;
+}
+
+STATIC INLINE UINT32 OsMemBackupTryRestore(VOID *pool, LosMemDynNode **node, const VOID *ptr)
+{
+    LosMemDynNode *nodeHead = NULL;
+    LosMemDynNode *nodePre = OsMemNodePrevTryGet(pool, &nodeHead, ptr);
+    if (nodePre == NULL) {
+        return LOS_NOK;
+    }
+
+    *node = nodeHead;
+    return OsMemBackupDoRestore(pool, nodePre, *node);
+}
+
+STATIC INLINE UINT32 OsMemBackupRestore(VOID *pool, LosMemDynNode *node)
+{
+    LosMemDynNode *nodePre = OsMemNodePrevGet(pool, node);
+    if (nodePre == NULL) {
+        return LOS_NOK;
+    }
+
+    return OsMemBackupDoRestore(pool, nodePre, node);
+}
+
+STATIC INLINE UINT32 OsMemBackupCheckAndRetore(VOID *pool, VOID *ptr, LosMemDynNode *node)
+{
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)pool;
+    LosMemDynNode *startNode = OS_MEM_FIRST_NODE(pool);
+    LosMemDynNode *endNode   = OS_MEM_END_NODE(pool, poolInfo->poolSize);
+
+    if (OS_MEM_MIDDLE_ADDR(startNode, node, endNode)) {
+        /* GapSize is bad or node is broken, we need to verify & try to restore */
+        if (!OsMemChecksumVerify(&(node->selfNode))) {
+            node = (LosMemDynNode *)((UINTPTR)ptr - OS_MEM_NODE_HEAD_SIZE);
+            return OsMemBackupTryRestore(pool, &node, ptr);
+        }
+    }
+    return LOS_OK;
+}
+
+STATIC INLINE VOID OsMemSetGapSize(LosMemCtlNode *ctlNode, UINT32 gapSize)
+{
+    ctlNode->gapSize = gapSize;
+}
+
+STATIC VOID OsMemNodeSave(LosMemDynNode *node)
+{
+    OsMemSetGapSize(&(node->selfNode), 0);
+    OsMemChecksumSet(&(node->selfNode));
+    OsMemBackupSetup(node);
+}
+
+STATIC VOID OsMemNodeSaveWithGapSize(LosMemDynNode *node, UINT32 gapSize)
+{
+    OsMemSetGapSize(&(node->selfNode), gapSize);
+    OsMemChecksumSet(&(node->selfNode));
+    OsMemBackupSetup(node);
+}
+
+STATIC VOID OsMemListDelete(LOS_DL_LIST *node, const VOID *firstNode)
+{
+    LosMemDynNode *dynNode = NULL;
+
+    node->pstNext->pstPrev = node->pstPrev;
+    node->pstPrev->pstNext = node->pstNext;
+
+    if ((VOID *)(node->pstNext) >= firstNode) {
+        dynNode = LOS_DL_LIST_ENTRY(node->pstNext, LosMemDynNode, selfNode.freeNodeInfo);
+        OsMemNodeSave(dynNode);
+    }
+
+    if ((VOID *)(node->pstPrev) >= firstNode) {
+        dynNode = LOS_DL_LIST_ENTRY(node->pstPrev, LosMemDynNode, selfNode.freeNodeInfo);
+        OsMemNodeSave(dynNode);
+    }
+
+    node->pstNext = NULL;
+    node->pstPrev = NULL;
+
+    dynNode = LOS_DL_LIST_ENTRY(node, LosMemDynNode, selfNode.freeNodeInfo);
+    OsMemNodeSave(dynNode);
+}
+
+STATIC VOID OsMemListAdd(LOS_DL_LIST *listNode, LOS_DL_LIST *node, const VOID *firstNode)
+{
+    LosMemDynNode *dynNode = NULL;
+
+    node->pstNext = listNode->pstNext;
+    node->pstPrev = listNode;
+
+    dynNode = LOS_DL_LIST_ENTRY(node, LosMemDynNode, selfNode.freeNodeInfo);
+    OsMemNodeSave(dynNode);
+
+    listNode->pstNext->pstPrev = node;
+    if ((VOID *)(listNode->pstNext) >= firstNode) {
+        dynNode = LOS_DL_LIST_ENTRY(listNode->pstNext, LosMemDynNode, selfNode.freeNodeInfo);
+        OsMemNodeSave(dynNode);
+    }
+
+    listNode->pstNext = node;
+}
+
+VOID LOS_MemBadNodeShow(VOID *pool)
+{
+    LosMemDynNode *nodePre = NULL;
+    LosMemDynNode *tmpNode = NULL;
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)pool;
+    UINT32 intSave;
+
+    if (pool == NULL) {
+        return;
+    }
+
+    MEM_LOCK(intSave);
+
+    for (tmpNode = OS_MEM_FIRST_NODE(pool); tmpNode <= OS_MEM_END_NODE(pool, poolInfo->poolSize);
+         tmpNode = OS_MEM_NEXT_NODE(tmpNode)) {
+        OsMemDispCtlNode(&tmpNode->selfNode);
+
+        if (OsMemChecksumVerify(&tmpNode->selfNode)) {
+            continue;
+        }
+
+        nodePre = OsMemNodePrevGet(pool, tmpNode);
+        if (nodePre == NULL) {
+            PRINT_ERR("the current node is invalid, but cannot find its previous Node\n");
+            continue;
+        }
+
+        PRINT_ERR("the detailed information of previous node:\n");
+        OsMemDispMoreDetails(nodePre);
+    }
+
+    MEM_UNLOCK(intSave);
+    PRINTK("check finish\n");
+}
+
+#else  /* without LOSCFG_MEM_HEAD_BACKUP */
+
+STATIC VOID OsMemListDelete(LOS_DL_LIST *node, const VOID *firstNode)
+{
+    (VOID)firstNode;
+    node->pstNext->pstPrev = node->pstPrev;
+    node->pstPrev->pstNext = node->pstNext;
+    node->pstNext = NULL;
+    node->pstPrev = NULL;
+}
+
+STATIC VOID OsMemListAdd(LOS_DL_LIST *listNode, LOS_DL_LIST *node, const VOID *firstNode)
+{
+    (VOID)firstNode;
+    node->pstNext = listNode->pstNext;
+    node->pstPrev = listNode;
+    listNode->pstNext->pstPrev = node;
+    listNode->pstNext = node;
+}
+
+#endif
+
+#ifdef LOSCFG_MEM_LEAKCHECK
+__attribute__((always_inline)) inline VOID OsMemLinkRegisterRecord(LosMemDynNode *node)
+{
+    UINT32 count = 0;
+    UINT32 index = 0;
+    UINTPTR framePtr, tmpFramePtr, linkReg;
+
+    (VOID)memset_s(node->selfNode.linkReg, (LOS_RECORD_LR_CNT * sizeof(UINTPTR)), 0,
+        (LOS_RECORD_LR_CNT * sizeof(UINTPTR)));
+    framePtr = ArchGetFp();
+    while ((framePtr > OS_SYS_FUNC_ADDR_START) && (framePtr < OS_SYS_FUNC_ADDR_END)) {
+        tmpFramePtr = framePtr;
+#ifdef __LP64__
+        framePtr = *(UINTPTR *)framePtr;
+        linkReg = *(UINTPTR *)(tmpFramePtr + sizeof(UINTPTR));
+#else
+        linkReg = *(UINTPTR *)framePtr;
+        framePtr = *(UINTPTR *)(tmpFramePtr - sizeof(UINTPTR));
+#endif
+        if (index >= LOS_OMIT_LR_CNT) {
+            node->selfNode.linkReg[count++] = linkReg;
+            if (count == LOS_RECORD_LR_CNT) {
+                break;
+            }
+        }
+        index++;
+    }
+    return;
+}
+
+#ifdef LOSCFG_BASE_MEM_NODE_INTEGRITY_CHECK
+STATIC VOID OsMemNodeBacktraceInfo(const LosMemDynNode *tmpNode, const LosMemDynNode *preNode)
+{
+    INT32 i;
+    PRINTK("\n broken node head LR info: \n");
+    for (i = 0; i < LOS_RECORD_LR_CNT; i++) {
+        PRINTK(" LR[%d]:%p\n", i, tmpNode->selfNode.linkReg[i]);
+    }
+    PRINTK("\n pre node head LR info: \n");
+    for (i = 0; i < LOS_RECORD_LR_CNT; i++) {
+        PRINTK(" LR[%d]:%p\n", i, preNode->selfNode.linkReg[i]);
+    }
+
+#ifdef LOSCFG_SHELL_EXCINFO_DUMP
+    WriteExcInfoToBuf("\n broken node head LR info: \n");
+    for (i = 0; i < LOS_RECORD_LR_CNT; i++) {
+        WriteExcInfoToBuf("LR[%d]:%p\n", i, tmpNode->selfNode.linkReg[i]);
+    }
+    WriteExcInfoToBuf("\n pre node head LR info: \n");
+    for (i = 0; i < LOS_RECORD_LR_CNT; i++) {
+        WriteExcInfoToBuf("LR[%d]:%p\n", i, preNode->selfNode.linkReg[i]);
+    }
+#endif
+}
+#endif
+
+LITE_OS_SEC_TEXT_MINOR VOID OsMemUsedNodeShow(VOID *pool)
+{
+    LosMemDynNode *tmpNode = NULL;
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)pool;
+    UINT32 intSave;
+    UINT32 count;
+
+    if (pool == NULL) {
+        PRINTK("input param is NULL\n");
+        return;
+    }
+    if (LOS_MemIntegrityCheck(pool)) {
+        PRINTK("LOS_MemIntegrityCheck error\n");
+        return;
+    }
+    MEM_LOCK(intSave);
+#ifdef __LP64__
+    PRINTK("node                ");
+#else
+    PRINTK("node        ");
+#endif
+    for (count = 0; count < LOS_RECORD_LR_CNT; count++) {
+#ifdef __LP64__
+        PRINTK("        LR[%u]       ", count);
+#else
+        PRINTK("    LR[%u]   ", count);
+#endif
+    }
+    PRINTK("\n");
+    for (tmpNode = OS_MEM_FIRST_NODE(pool); tmpNode < OS_MEM_END_NODE(pool, poolInfo->poolSize);
+         tmpNode = OS_MEM_NEXT_NODE(tmpNode)) {
+        if (OS_MEM_NODE_GET_USED_FLAG(tmpNode->selfNode.sizeAndFlag)) {
+#ifdef __LP64__
+            PRINTK("%018p: ", tmpNode);
+#else
+            PRINTK("%010p: ", tmpNode);
+#endif
+            for (count = 0; count < LOS_RECORD_LR_CNT; count++) {
+#ifdef __LP64__
+                PRINTK(" %018p ", tmpNode->selfNode.linkReg[count]);
+#else
+                PRINTK(" %010p ", tmpNode->selfNode.linkReg[count]);
+#endif
+            }
+            PRINTK("\n");
+        }
+    }
+    MEM_UNLOCK(intSave);
+    return;
+}
+
+#endif
+
+#ifdef LOSCFG_MEM_RECORDINFO
+STATIC INLINE VOID OsMemReallocNodeRecord(LosMemDynNode *node, UINT32 size, const VOID *ptr)
+{
+    node->selfNode.originSize = size;
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+    OsMemNodeSave(node);
+#endif
+    OsMemRecordMalloc(ptr, size);
+}
+#endif
+
+#ifdef LOSCFG_KERNEL_MEM_SLAB_EXTENTION
+
+STATIC VOID *OsMemReallocSlab(VOID *pool, VOID *ptr, BOOL *isSlabMem, UINT32 size)
+{
+    errno_t rc;
+    UINT32 blkSz;
+    VOID *newPtr = NULL;
+    VOID *freePtr = ptr;
+
+    blkSz = OsSlabMemCheck(pool, ptr);
+    if (blkSz == (UINT32)-1) {
+        *isSlabMem = FALSE;
+        return NULL;
+    }
+    *isSlabMem = TRUE;
+
+    if (size <= blkSz) {
+        return ptr;
+    }
+
+    /* Unlock the memory spin, to allow the memory alloc API to be called */
+    LOS_SpinUnlock(&g_memSpin);
+
+    if (newPtr == NULL) {
+        newPtr = LOS_MemAlloc(pool, size);
+    }
+
+    if (newPtr != NULL) {
+        rc = memcpy_s(newPtr, size, ptr, blkSz);
+        if (rc != EOK) {
+            PRINT_ERR("%s[%d] memcpy_s failed, error type = %d\n", __FUNCTION__, __LINE__, rc);
+            freePtr = newPtr;
+            newPtr = NULL;
+        }
+        if (LOS_MemFree((VOID *)pool, freePtr) != LOS_OK) {
+            PRINT_ERR("%s, %d\n", __FUNCTION__, __LINE__);
+        }
+    }
+
+    /* Reacquire the spin */
+    LOS_SpinLock(&g_memSpin);
+
+    return newPtr;
+}
+
+VOID *OsMemAlloc(VOID *pool, UINT32 size)
+{
+    return OsMemAllocWithCheck(pool, size);
+}
+
+#else
+
+STATIC VOID *OsMemReallocSlab(VOID *pool, const VOID *ptr, BOOL *isSlabMem, UINT32 size)
+{
+    *isSlabMem = FALSE;
+    return NULL;
+}
+
+#endif
+
+#ifdef LOSCFG_EXC_INTERACTION
+LITE_OS_SEC_TEXT_INIT UINT32 OsMemExcInteractionInit(UINTPTR memStart)
+{
+    UINT32 ret;
+    m_aucSysMem0 = (UINT8 *)((memStart + (POOL_ADDR_ALIGNSIZE - 1)) & ~((UINTPTR)(POOL_ADDR_ALIGNSIZE - 1)));
+    g_excInteractMemSize = EXC_INTERACT_MEM_SIZE;
+    ret = LOS_MemInit(m_aucSysMem0, g_excInteractMemSize);
+    PRINT_INFO("LiteOS kernel exc interaction memory address:%p,size:0x%x\n", m_aucSysMem0, g_excInteractMemSize);
+    return ret;
+}
+#endif
+
+LITE_OS_SEC_TEXT_INIT UINT32 OsMemSystemInit(UINTPTR memStart)
+{
+    UINT32 ret;
+    UINT32 poolSize;
+
+    m_aucSysMem1 = (UINT8 *)((memStart + (POOL_ADDR_ALIGNSIZE - 1)) & ~((UINTPTR)(POOL_ADDR_ALIGNSIZE - 1)));
+    poolSize = OS_SYS_MEM_SIZE;
+    ret = LOS_MemInit(m_aucSysMem1, poolSize);
+    PRINT_INFO("LiteOS system heap memory address:%p,size:0x%x\n", m_aucSysMem1, poolSize);
+#ifndef LOSCFG_EXC_INTERACTION
+    m_aucSysMem0 = m_aucSysMem1;
+#endif
+    return ret;
+}
+
+/*
+ * Description : find suitable free block use "best fit" algorithm
+ * Input       : pool      --- Pointer to memory pool
+ *               allocSize --- Size of memory in bytes which note need allocate
+ * Return      : NULL      --- no suitable block found
+ *               tmpNode   --- pointer a suitable free block
+ */
+STATIC INLINE LosMemDynNode *OsMemFindSuitableFreeBlock(VOID *pool, UINT32 allocSize)
+{
+    LOS_DL_LIST *listNodeHead = NULL;
+    LosMemDynNode *tmpNode = NULL;
+
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+    UINT32 ret = LOS_OK;
+#endif
+    for (listNodeHead = OS_MEM_HEAD(pool, allocSize); listNodeHead != NULL;
+         listNodeHead = OsDLnkNextMultiHead(OS_MEM_HEAD_ADDR(pool), listNodeHead)) {
+        LOS_DL_LIST_FOR_EACH_ENTRY(tmpNode, listNodeHead, LosMemDynNode, selfNode.freeNodeInfo) {
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+            if (!OsMemChecksumVerify(&tmpNode->selfNode)) {
+                PRINT_ERR("[%s]: the node information of current node is bad !!\n", __FUNCTION__);
+                OsMemDispCtlNode(&tmpNode->selfNode);
+                ret = OsMemBackupRestore(pool, tmpNode);
+            }
+            if (ret != LOS_OK) {
+                break;
+            }
+#endif
+
+#ifdef LOSCFG_MEM_DEBUG
+            if (((UINTPTR)tmpNode < (UINTPTR)pool) ||
+                ((UINTPTR)tmpNode > ((UINTPTR)pool + ((LosMemPoolInfo *)pool)->poolSize)) ||
+                (((UINTPTR)tmpNode & (OS_MEM_ALIGN_SIZE - 1)) != 0)) {
+                LOS_Panic("[%s:%d]Mem node data error:OS_MEM_HEAD_ADDR(pool)=%p, listNodeHead:%p,"
+                          "allocSize=%u, tmpNode=%p\n",
+                          __FUNCTION__, __LINE__, OS_MEM_HEAD_ADDR(pool), listNodeHead, allocSize, tmpNode);
+                break;
+            }
+#endif
+            if (tmpNode->selfNode.sizeAndFlag >= allocSize) {
+                return tmpNode;
             }
         }
     }
 
-    return (LOS_MEM_DYN_NODE *)NULL;
+    return NULL;
 }
 
-/*****************************************************************************
- Function : osMemClearNode
- Description : clear a mem Node , set every member to NULL
- Input       : pstNode    --- Pointer to the mem node which will be cleared up
- Output      : None
- Return      : None
-*****************************************************************************/
-LITE_OS_SEC_ALW_INLINE STATIC_INLINE VOID osMemClearNode(LOS_MEM_DYN_NODE *pstNode)
+/*
+ * Description : clear a mem node, set every member to NULL
+ * Input       : node    --- Pointer to the mem node which will be cleared up
+ */
+STATIC INLINE VOID OsMemClearNode(LosMemDynNode *node)
 {
-    pstNode->stFreeNodeInfo.pstPrev = (LOS_DL_LIST *)NULL;
-    pstNode->stFreeNodeInfo.pstNext = (LOS_DL_LIST *)NULL;
-    pstNode->pstPreNode = (LOS_MEM_DYN_NODE *)NULL;
+    (VOID)memset_s((VOID *)node, sizeof(LosMemDynNode), 0, sizeof(LosMemDynNode));
 }
 
-/*****************************************************************************
- Function : osMemMergeNode
- Description : merge this node and pre node ,then clear this node info
- Input       : pstNode    --- Pointer to node which will be merged
- Output      : None
- Return      : None
-*****************************************************************************/
-LITE_OS_SEC_ALW_INLINE STATIC_INLINE VOID osMemMergeNode(LOS_MEM_DYN_NODE *pstNode)
+/*
+ * Description : merge this node and pre node, then clear this node info
+ * Input       : node    --- Pointer to node which will be merged
+ */
+STATIC INLINE VOID OsMemMergeNode(LosMemDynNode *node)
 {
-    LOS_MEM_DYN_NODE *pstNextNode = (LOS_MEM_DYN_NODE *)NULL;
+    LosMemDynNode *nextNode = NULL;
 
-    pstNode->pstPreNode->uwSizeAndFlag += pstNode->uwSizeAndFlag;
-    pstNextNode = (LOS_MEM_DYN_NODE *)((UINT32)pstNode + pstNode->uwSizeAndFlag);
-    pstNextNode->pstPreNode = pstNode->pstPreNode;
-    osMemClearNode(pstNode);
-}
-
-/*****************************************************************************
- Function : osMemSpitNode
- Description : spit new node from pstAllocNode, and merge remainder mem if necessary
- Input       : pPool --Pointer to memory pool
-                  pstAllocNode --the source node which new node be spit from to.
-                                        After pick up it's node info, change to point the new node
-                  uwAllocSize -- the size of new node
- Output      : pstAllocNode -- save new node addr
- Return      : None
-*****************************************************************************/
-LITE_OS_SEC_ALW_INLINE STATIC_INLINE VOID osMemSpitNode(VOID *pPool,
-                            LOS_MEM_DYN_NODE *pstAllocNode, UINT32 uwAllocSize)
-{
-    LOS_MEM_DYN_NODE *pstNewFreeNode = (LOS_MEM_DYN_NODE *)NULL;
-    LOS_MEM_DYN_NODE *pstNextNode = (LOS_MEM_DYN_NODE *)NULL;
-    LOS_DL_LIST *pstListHead = (LOS_DL_LIST *)NULL;
-
-    pstNewFreeNode = (LOS_MEM_DYN_NODE *)((UINT8 *)pstAllocNode + uwAllocSize);
-    pstNewFreeNode->pstPreNode = pstAllocNode;
-    pstNewFreeNode->uwSizeAndFlag = pstAllocNode->uwSizeAndFlag - uwAllocSize;
-    pstAllocNode->uwSizeAndFlag = uwAllocSize;
-    pstNextNode = OS_MEM_NEXT_NODE(pstNewFreeNode);
-    pstNextNode->pstPreNode = pstNewFreeNode;
-    if (!OS_MEM_NODE_GET_USED_FLAG(pstNextNode->uwSizeAndFlag))
-    {
-        LOS_ListDelete(&(pstNextNode->stFreeNodeInfo));
-        osMemMergeNode(pstNextNode);
-    }
-
-    pstListHead = OS_MEM_HEAD(pPool, pstNewFreeNode->uwSizeAndFlag);
-    if (NULL == pstListHead)
-    {
-        PRINT_ERR("%s %d\n", __FUNCTION__, __LINE__);
-        return;
-    }
-
-    LOS_ListAdd(pstListHead,&(pstNewFreeNode->stFreeNodeInfo));
-}
-
-/*****************************************************************************
- Function : osMemFreeNode
- Description : free the node from memory & if there are free node beside, merger them.
-                    at last update "pstListHead' which saved all free node control head
- Input       : pstNode -- the node which need be freed
-                  pPool --Pointer to memory pool
- Output      : None
- Return      : None
-*****************************************************************************/
-LITE_OS_SEC_TEXT STATIC_INLINE VOID osMemFreeNode(LOS_MEM_DYN_NODE *pstNode, VOID *pPool)
-{
-    LOS_MEM_DYN_NODE *pstNextNode = (LOS_MEM_DYN_NODE *)NULL;
-    LOS_DL_LIST *pstListHead = (LOS_DL_LIST *)NULL;
-
-#if (LOSCFG_MEM_TASK_USED_STATISTICS == YES)
-    OS_MEM_REDUCE_USED(OS_MEM_NODE_GET_SIZE(pstNode->uwSizeAndFlag));
+    node->selfNode.preNode->selfNode.sizeAndFlag += node->selfNode.sizeAndFlag;
+    nextNode = (LosMemDynNode *)((UINTPTR)node + node->selfNode.sizeAndFlag);
+    nextNode->selfNode.preNode = node->selfNode.preNode;
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+    OsMemNodeSave(node->selfNode.preNode);
+    OsMemNodeSave(nextNode);
 #endif
-    pstNode->uwSizeAndFlag = OS_MEM_NODE_GET_SIZE(pstNode->uwSizeAndFlag);
-    if ((pstNode->pstPreNode != NULL) &&
-        (!OS_MEM_NODE_GET_USED_FLAG(pstNode->pstPreNode->uwSizeAndFlag)))
-    {
-        LOS_MEM_DYN_NODE *pstPreNode = pstNode->pstPreNode;
-        osMemMergeNode(pstNode);
-        pstNextNode = OS_MEM_NEXT_NODE(pstPreNode);
-        if (!OS_MEM_NODE_GET_USED_FLAG(pstNextNode->uwSizeAndFlag))
-        {
-#ifdef OS_MEM_ENABLE_ALLOC_CHECK
-            LOS_MemFreeNodeCheck(pPool, pstNextNode);//fjg
+    OsMemClearNode(node);
+}
+
+/*
+ * Description : split new node from allocNode, and merge remainder mem if necessary
+ * Input       : pool      -- Pointer to memory pool
+ *               allocNode -- the source node which the new node will split from it.
+ *                            After pick up it's node info, change to point to the new node
+ *               allocSize -- the size of new node
+ * Output      : allocNode -- save new node addr
+ */
+STATIC INLINE VOID OsMemSplitNode(VOID *pool,
+                                  LosMemDynNode *allocNode, UINT32 allocSize)
+{
+    LosMemDynNode *newFreeNode = NULL;
+    LosMemDynNode *nextNode = NULL;
+    LOS_DL_LIST *listNodeHead = NULL;
+    const VOID *firstNode = (const VOID *)((UINT8 *)OS_MEM_HEAD_ADDR(pool) + OS_DLNK_HEAD_SIZE);
+
+    newFreeNode = (LosMemDynNode *)(VOID *)((UINT8 *)allocNode + allocSize);
+    newFreeNode->selfNode.preNode = allocNode;
+    newFreeNode->selfNode.sizeAndFlag = allocNode->selfNode.sizeAndFlag - allocSize;
+    allocNode->selfNode.sizeAndFlag = allocSize;
+    nextNode = OS_MEM_NEXT_NODE(newFreeNode);
+    nextNode->selfNode.preNode = newFreeNode;
+    if (!OS_MEM_NODE_GET_USED_FLAG(nextNode->selfNode.sizeAndFlag)) {
+        OsMemListDelete(&nextNode->selfNode.freeNodeInfo, firstNode);
+        OsMemMergeNode(nextNode);
+    }
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+    else {
+        OsMemNodeSave(nextNode);
+    }
 #endif
-            LOS_ListDelete(&(pstNextNode->stFreeNodeInfo));
-            osMemMergeNode(pstNextNode);
-        }
+    listNodeHead = OS_MEM_HEAD(pool, newFreeNode->selfNode.sizeAndFlag);
+    OS_CHECK_NULL_RETURN(listNodeHead);
 
-        LOS_ListDelete(&(pstPreNode->stFreeNodeInfo));
-        pstListHead = OS_MEM_HEAD(pPool, pstPreNode->uwSizeAndFlag);
-        if (NULL == pstListHead)
-        {
-            PRINT_ERR("%s %d\n", __FUNCTION__, __LINE__);
-            return;
-        }
-
-        LOS_ListAdd(pstListHead,&(pstPreNode->stFreeNodeInfo));
-    }
-    else
-    {
-        pstNextNode = OS_MEM_NEXT_NODE(pstNode);
-        if (!OS_MEM_NODE_GET_USED_FLAG(pstNextNode->uwSizeAndFlag))
-        {
-#ifdef OS_MEM_ENABLE_ALLOC_CHECK
-            LOS_MemFreeNodeCheck(pPool, pstNextNode);//fjg
+    OsMemListAdd(listNodeHead, &newFreeNode->selfNode.freeNodeInfo, firstNode);
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+    OsMemNodeSave(newFreeNode);
 #endif
-            LOS_ListDelete(&(pstNextNode->stFreeNodeInfo));
-            osMemMergeNode(pstNextNode);
+}
+
+/*
+ * Description : free the node from memory & if there are free node beside, merger them.
+ *               at last update "listNodeHead' which saved all free node control head
+ * Input       : node -- the node which need be freed
+ *               pool -- Pointer to memory pool
+ */
+STATIC INLINE VOID OsMemFreeNode(LosMemDynNode *node, LosMemPoolInfo *pool)
+{
+    LosMemDynNode *nextNode = NULL;
+    LOS_DL_LIST *listNodeHead = NULL;
+    const VOID *firstNode = (const VOID *)((UINT8 *)OS_MEM_HEAD_ADDR(pool) + OS_DLNK_HEAD_SIZE);
+
+    OS_MEM_REDUCE_USED(&pool->stat, OS_MEM_NODE_GET_SIZE(node->selfNode.sizeAndFlag), OS_MEM_TASKID_GET(node));
+    node->selfNode.sizeAndFlag = OS_MEM_NODE_GET_SIZE(node->selfNode.sizeAndFlag);
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+    OsMemNodeSave(node);
+#endif
+#ifdef LOSCFG_MEM_LEAKCHECK
+    OsMemLinkRegisterRecord(node);
+#endif
+    if ((node->selfNode.preNode != NULL) &&
+        !OS_MEM_NODE_GET_USED_FLAG(node->selfNode.preNode->selfNode.sizeAndFlag)) {
+        LosMemDynNode *preNode = node->selfNode.preNode;
+        OsMemMergeNode(node);
+        nextNode = OS_MEM_NEXT_NODE(preNode);
+        if (!OS_MEM_NODE_GET_USED_FLAG(nextNode->selfNode.sizeAndFlag)) {
+            OsMemListDelete(&nextNode->selfNode.freeNodeInfo, firstNode);
+            OsMemMergeNode(nextNode);
         }
 
-        pstListHead = OS_MEM_HEAD(pPool, pstNode->uwSizeAndFlag);
-        if (NULL == pstListHead)
-        {
-            PRINT_ERR("%s %d\n", __FUNCTION__, __LINE__);
-            return;
+        OsMemListDelete(&(preNode->selfNode.freeNodeInfo), firstNode);
+        listNodeHead = OS_MEM_HEAD(pool, preNode->selfNode.sizeAndFlag);
+        OS_CHECK_NULL_RETURN(listNodeHead);
+
+        OsMemListAdd(listNodeHead, &preNode->selfNode.freeNodeInfo, firstNode);
+    } else {
+        nextNode = OS_MEM_NEXT_NODE(node);
+        if (!OS_MEM_NODE_GET_USED_FLAG(nextNode->selfNode.sizeAndFlag)) {
+            OsMemListDelete(&nextNode->selfNode.freeNodeInfo, firstNode);
+            OsMemMergeNode(nextNode);
         }
 
-        LOS_ListAdd(pstListHead,&(pstNode->stFreeNodeInfo));
+        listNodeHead = OS_MEM_HEAD(pool, node->selfNode.sizeAndFlag);
+        OS_CHECK_NULL_RETURN(listNodeHead);
+
+        OsMemListAdd(listNodeHead, &node->selfNode.freeNodeInfo, firstNode);
     }
 }
 
-/*****************************************************************************
- Function : osMemCheckUsedNode
- Description : check the result if pointer memory node belongs to pointer memory pool
- Input       : pPool --Pointer to memory pool
-                  pstNode -- the node which need be checked
- Output      : None
- Return      : LOS_OK or LOS_NOK
-*****************************************************************************/
-#ifdef LOS_DLNK_SAFE_CHECK
-LITE_OS_SEC_TEXT_MINOR STATIC_INLINE UINT32 osMemCheckUsedNode(VOID *pPool, LOS_MEM_DYN_NODE *pstNode)
+#ifdef LOSCFG_MEM_DEBUG
+/*
+ * Description : check the result if pointer memory node belongs to pointer memory pool
+ * Input       : pool -- Pointer to memory pool
+ *               node -- the node which need be checked
+ * Return      : LOS_OK or LOS_NOK
+ */
+STATIC INLINE BOOL OsMemIsNodeValid(const LosMemDynNode *node, const LosMemDynNode *startNode,
+                                    const LosMemDynNode *endNode,
+                                    const UINT8 *startPool, const UINT8 *endPool)
 {
-    LOS_MEM_DYN_NODE *pstTmp = NULL;
-    LOS_MEM_POOL_INFO *pstPoolInfo = (LOS_MEM_POOL_INFO *)pPool;
-    LOS_MEM_DYN_NODE *pstEnd = OS_MEM_END_NODE(pPool, pstPoolInfo->uwPoolSize);
-
-    for (pstTmp = OS_MEM_FIRST_NODE(pPool); pstTmp < pstEnd; pstTmp = OS_MEM_NEXT_NODE(pstTmp ))
-    {
-        if ((pstTmp == pstNode) &&
-            OS_MEM_NODE_GET_USED_FLAG(pstTmp->uwSizeAndFlag))
-        {
-            return LOS_OK;
-        }
-        else if (pstTmp > pstNode)
-        {
-            return LOS_NOK;
-        }
-    }
-
-    return LOS_NOK;
-}
-
-#elif defined(LOS_DLNK_SIMPLE_CHECK)
-LITE_OS_SEC_TEXT_MINOR STATIC_INLINE UINT32 osMemCheckUsedNode(VOID *pPool, LOS_MEM_DYN_NODE *pstNode)
-{
-    LOS_MEM_POOL_INFO *pstPoolInfo = (LOS_MEM_POOL_INFO *)pPool;
-    LOS_MEM_DYN_NODE *pstStartNode = OS_MEM_FIRST_NODE(pPool);
-    LOS_MEM_DYN_NODE *pstEndNode = OS_MEM_END_NODE(pPool, pstPoolInfo->uwPoolSize);
-    if (!OS_MEM_MIDDLE_ADDR_OPEN_END(pstStartNode, pstNode, pstEndNode))
-    {
-        return LOS_NOK;
-    }
-
-    if (!OS_MEM_NODE_GET_USED_FLAG(pstNode->uwSizeAndFlag))
-    {
-        return LOS_NOK;
-    }
-
-    if ((!OS_MEM_MAGIC_VALID(pstNode->stFreeNodeInfo.pstPrev))
-        //|| (!OS_MEM_MAGIC_VALID(pstNode->stFreeNodeInfo.pstNext))
-        )
-    {
-        return LOS_NOK;
-    }
-
-    return LOS_OK;
-}
-
-#else
-LITE_OS_SEC_ALW_INLINE STATIC_INLINE BOOL osMemIsNodeValid(const LOS_MEM_DYN_NODE *pstNode, const LOS_MEM_DYN_NODE *pstStartNode, const LOS_MEM_DYN_NODE *pstEndNode,
-       const UINT8 *pucStartPool, const UINT8 *pucEndPool)
-{
-    if (!OS_MEM_MIDDLE_ADDR(pstStartNode, pstNode, pstEndNode))
-    {
+    if (!OS_MEM_MIDDLE_ADDR(startNode, node, endNode)) {
         return FALSE;
     }
 
-    if (OS_MEM_NODE_GET_USED_FLAG(pstNode->uwSizeAndFlag))
-    {
-        if ((!OS_MEM_MAGIC_VALID(pstNode->stFreeNodeInfo.pstPrev))
-             // || (!OS_MEM_MAGIC_VALID(pstNode->stFreeNodeInfo.pstNext))
-             )
-        {
+    if (OS_MEM_NODE_GET_USED_FLAG(node->selfNode.sizeAndFlag)) {
+        if (!OS_MEM_MAGIC_VALID(node->selfNode.freeNodeInfo.pstPrev)) {
             return FALSE;
         }
         return TRUE;
     }
 
-    if ((!OS_MEM_MIDDLE_ADDR_OPEN_END(pucStartPool, pstNode->stFreeNodeInfo.pstPrev, pucEndPool))
-       // || (!OS_MEM_MIDDLE_ADDR_OPEN_END(pucStartPool, pstNode->stFreeNodeInfo.pstNext, pucEndPool))
-       )
-    {
+    if (!OS_MEM_MIDDLE_ADDR_OPEN_END(startPool, node->selfNode.freeNodeInfo.pstPrev, endPool)) {
         return FALSE;
     }
 
     return TRUE;
 }
 
-LITE_OS_SEC_TEXT_MINOR STATIC_INLINE UINT32 osMemCheckUsedNode(VOID *pPool, LOS_MEM_DYN_NODE *pstNode)
+STATIC INLINE UINT32 OsMemCheckUsedNode(const VOID *pool, const LosMemDynNode *node)
 {
-    LOS_MEM_POOL_INFO *pstPoolInfo = (LOS_MEM_POOL_INFO *)pPool;
-    LOS_MEM_DYN_NODE *pstStartNode = OS_MEM_FIRST_NODE(pPool);
-    LOS_MEM_DYN_NODE *pstEndNode = OS_MEM_END_NODE(pPool, pstPoolInfo->uwPoolSize);
-    UINT8 *pucEndPool = (UINT8 *)pPool + pstPoolInfo->uwPoolSize;
-    const LOS_MEM_DYN_NODE *pstNextNode = (const LOS_MEM_DYN_NODE *)NULL;
-    if (!osMemIsNodeValid(pstNode, pstStartNode, pstEndNode, (UINT8 *)pPool, pucEndPool))
-    {
+    const LosMemPoolInfo *poolInfo = (const LosMemPoolInfo *)pool;
+    const LosMemDynNode *startNode = (const LosMemDynNode *)OS_MEM_FIRST_NODE(pool);
+    const LosMemDynNode *endNode = (const LosMemDynNode *)OS_MEM_END_NODE(pool, poolInfo->poolSize);
+    const UINT8 *endPool = (const UINT8 *)pool + poolInfo->poolSize;
+    const LosMemDynNode *nextNode = NULL;
+    if (!OsMemIsNodeValid(node, startNode, endNode, (UINT8 *)pool, endPool)) {
         return LOS_NOK;
     }
 
-    if (!OS_MEM_NODE_GET_USED_FLAG(pstNode->uwSizeAndFlag))
-
-    {
+    if (!OS_MEM_NODE_GET_USED_FLAG(node->selfNode.sizeAndFlag)) {
         return LOS_NOK;
     }
 
-    pstNextNode = OS_MEM_NEXT_NODE(pstNode);
-    if (!osMemIsNodeValid(pstNextNode, pstStartNode, pstEndNode, (UINT8 *)pPool, pucEndPool))
-    {
+    nextNode = OS_MEM_NEXT_NODE(node);
+    if (!OsMemIsNodeValid(nextNode, startNode, endNode, (UINT8 *)pool, endPool)) {
         return LOS_NOK;
     }
 
-    if (pstNextNode->pstPreNode != pstNode)
-    {
+    if (nextNode->selfNode.preNode != node) {
         return LOS_NOK;
     }
 
-    if (pstNode != pstStartNode)
-    {
-        if (!osMemIsNodeValid(pstNode->pstPreNode, pstStartNode, pstEndNode, (UINT8 *)pPool, pucEndPool))
-        {
+    if (node != startNode) {
+        if (!OsMemIsNodeValid(node->selfNode.preNode, startNode, endNode, (UINT8 *)pool, endPool)) {
             return LOS_NOK;
         }
 
-        if (OS_MEM_NEXT_NODE(pstNode->pstPreNode) != pstNode)
-        {
+        if (OS_MEM_NEXT_NODE(node->selfNode.preNode) != node) {
             return LOS_NOK;
         }
     }
 
     return LOS_OK;
 }
-
+#else
+STATIC INLINE UINT32 OsMemCheckUsedNode(const VOID *pool, const LosMemDynNode *node)
+{
+    return LOS_OK;
+}
 #endif
 
-/*****************************************************************************
- Function : osMemSetMagicNumAndTaskid
- Description : set magic & taskid
- Input       : pstNode -- the node which will be set magic &  taskid
- Output      : None
- Return      : None
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR STATIC_INLINE VOID osMemSetMagicNumAndTaskid(LOS_MEM_DYN_NODE *pstNode)
+#ifdef LOSCFG_BASE_MEM_NODE_INTEGRITY_CHECK
+LITE_OS_SEC_TEXT_MINOR STATIC INLINE UINT32 OsMemPoolDlinkcheck(const LosMemPoolInfo *pool, LOS_DL_LIST listHead)
 {
-    OS_MEM_SET_MAGIC(pstNode->stFreeNodeInfo.pstPrev);
-
-    /* In the process of dynamic memory initialization,direct use of uninitialized global variablewhich initialized in task initialization.
-        Need to exclude this scene, make the value of pstNode->stFreeNodeInfo.pstNext to 0xffffffff */
-    if (g_stLosTask.pstRunTask != NULL)
-    {
-        pstNode->stFreeNodeInfo.pstNext = (LOS_DL_LIST *)(g_stLosTask.pstRunTask->uwTaskID);
-    }
-    else
-    {
-        /* If the task mode does not initialize, the field is the 0xffffffff */
-        pstNode->stFreeNodeInfo.pstNext = (LOS_DL_LIST *)0xffffffff;
-        /* TODO: the commend task-MEMUSE is not include system initialization malloc */
-    }
-}
-
-/*****************************************************************************
- Function : LOS_MemIntegrityCheck
- Description : memory pool integrity checking
- Input       : pPool --Pointer to memory pool
- Output      : None
- Return      : LOS_OK --memory pool integrate  or LOS_NOK--memory pool impaired
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemIntegrityCheck(VOID *pPool)
-{
-    LOS_MEM_DYN_NODE *pstTmpNode = (LOS_MEM_DYN_NODE *)NULL;
-    LOS_MEM_DYN_NODE *pstPreNode = (LOS_MEM_DYN_NODE *)NULL;
-    LOS_MEM_POOL_INFO *pstPoolInfo = (LOS_MEM_POOL_INFO *)pPool;
-    UINT8 *pucEndPool;
-    LOS_TASK_CB *pstTaskCB;
-    UINT32 uwTaskID;
-    UINTPTR uvIntSave;
-
-    if (pPool == NULL)
-    {
+    if (((UINTPTR)listHead.pstPrev < (UINTPTR)(pool + 1)) ||
+        ((UINTPTR)listHead.pstPrev >= ((UINTPTR)pool + pool->poolSize)) ||
+        ((UINTPTR)listHead.pstNext < (UINTPTR)(pool + 1)) ||
+        ((UINTPTR)listHead.pstNext >= ((UINTPTR)pool + pool->poolSize)) ||
+        !IS_ALIGNED(listHead.pstPrev, sizeof(VOID *)) ||
+        !IS_ALIGNED(listHead.pstNext, sizeof(VOID *))) {
         return LOS_NOK;
     }
 
-    pucEndPool = (UINT8 *)pPool + pstPoolInfo->uwPoolSize;
+    return LOS_OK;
+}
 
-    uvIntSave = LOS_IntLock();
-    pstPreNode = OS_MEM_FIRST_NODE(pPool);
-    for (pstTmpNode = OS_MEM_FIRST_NODE(pPool); pstTmpNode < OS_MEM_END_NODE(pPool, pstPoolInfo->uwPoolSize);
-        pstTmpNode = OS_MEM_NEXT_NODE(pstTmpNode))
-    {
+/*
+ * Description : show mem pool header info
+ * Input       : pool --Pointer to memory pool
+ */
+LITE_OS_SEC_TEXT_MINOR VOID OsMemPoolHeadInfoPrint(const VOID *pool)
+{
+    const LosMemPoolInfo *poolInfo = (const LosMemPoolInfo *)pool;
+    UINT32 dlinkNum;
+    UINT32 flag = 0;
+    const LosMultipleDlinkHead *dlinkHead = NULL;
 
-        if (OS_MEM_NODE_GET_USED_FLAG(pstTmpNode->uwSizeAndFlag))
-        {
-            if (!OS_MEM_MAGIC_VALID(pstTmpNode->stFreeNodeInfo.pstPrev))
-            {
-                PRINT_ERR("[%s], %d, memory check error!\n"
-                    "memory used but magic num wrong, stFreeNodeInfo.pstPrev(magic num):0x%x \n",
-                    __FUNCTION__, __LINE__, pstTmpNode->stFreeNodeInfo.pstPrev); /*lint !e626 !e515*/
-                goto errout;
-            }
-        }
-        else //is free node, check free node range
-        {
-            if (!OS_MEM_MIDDLE_ADDR_OPEN_END(pPool, pstTmpNode->stFreeNodeInfo.pstPrev, pucEndPool))
-            {
-                PRINT_ERR("[%s], %d, memory check error!\n"
-                    "stFreeNodeInfo.pstPrev:0x%x is out of legal mem range[0x%x, 0x%x]\n",
-                    __FUNCTION__, __LINE__, pstTmpNode->stFreeNodeInfo.pstPrev, pPool, pucEndPool); /*lint !e626 !e515*/
-                goto errout;
-            }
-            if (!OS_MEM_MIDDLE_ADDR_OPEN_END(pPool, pstTmpNode->stFreeNodeInfo.pstNext, pucEndPool))
-            {
-                PRINT_ERR("[%s], %d, memory check error!\n"
-                    "stFreeNodeInfo.pstNext:0x%x is out of legal mem range[0x%x, 0x%x]\n",
-                    __FUNCTION__, __LINE__, pstTmpNode->stFreeNodeInfo.pstNext, pPool, pucEndPool); /*lint !e626 !e515*/
-                goto errout;
-            }
-
-        LOS_MemFreeNodeCheck(pPool, pstTmpNode);//fjg
-        }
-
-        pstPreNode = pstTmpNode;
+    if (!IS_ALIGNED(poolInfo, sizeof(VOID *))) {
+        PRINT_ERR("wrong mem pool addr: %p, func:%s,line:%d\n", poolInfo, __FUNCTION__, __LINE__);
+#ifdef LOSCFG_SHELL_EXCINFO_DUMP
+        WriteExcInfoToBuf("wrong mem pool addr: %p, func:%s,line:%d\n", poolInfo, __FUNCTION__, __LINE__);
+#endif
+        return;
     }
-    LOS_IntRestore(uvIntSave);
+
+    dlinkHead = (const LosMultipleDlinkHead *)(VOID *)(poolInfo + 1);
+    for (dlinkNum = 0; dlinkNum < OS_MULTI_DLNK_NUM; dlinkNum++) {
+        if (OsMemPoolDlinkcheck(pool, dlinkHead->listHead[dlinkNum])) {
+            flag = 1;
+            PRINT_ERR("DlinkHead[%u]: pstPrev:%p, pstNext:%p\n",
+                      dlinkNum, dlinkHead->listHead[dlinkNum].pstPrev, dlinkHead->listHead[dlinkNum].pstNext);
+#ifdef LOSCFG_SHELL_EXCINFO_DUMP
+            WriteExcInfoToBuf("DlinkHead[%u]: pstPrev:%p, pstNext:%p\n",
+                              dlinkNum, dlinkHead->listHead[dlinkNum].pstPrev, dlinkHead->listHead[dlinkNum].pstNext);
+#endif
+        }
+    }
+    if (flag) {
+        PRINTK("mem pool info: poolAddr:%p, poolSize:0x%x\n", poolInfo->pool, poolInfo->poolSize);
+#ifdef LOSCFG_MEM_TASK_STAT
+        PRINTK("mem pool info: poolWaterLine:0x%x, poolCurUsedSize:0x%x\n", poolInfo->stat.memTotalPeak,
+               poolInfo->stat.memTotalUsed);
+#endif
+
+#ifdef LOSCFG_SHELL_EXCINFO_DUMP
+        WriteExcInfoToBuf("mem pool info: poolAddr:%p, poolSize:0x%x\n", poolInfo->pool, poolInfo->poolSize);
+#ifdef LOSCFG_MEM_TASK_STAT
+        WriteExcInfoToBuf("mem pool info: poolWaterLine:0x%x, poolCurUsedSize:0x%x\n",
+                          poolInfo->stat.memTotalPeak, poolInfo->stat.memTotalUsed);
+#endif
+#endif
+    }
+}
+
+STATIC UINT32 OsMemIntegrityCheck(const VOID *pool, LosMemDynNode **tmpNode, LosMemDynNode **preNode)
+{
+    const LosMemPoolInfo *poolInfo = (const LosMemPoolInfo *)pool;
+    const UINT8 *endPool = (const UINT8 *)pool + poolInfo->poolSize;
+
+    OsMemPoolHeadInfoPrint(pool);
+
+    *preNode = OS_MEM_FIRST_NODE(pool);
+    for (*tmpNode = OS_MEM_FIRST_NODE(pool); *tmpNode < OS_MEM_END_NODE(pool, poolInfo->poolSize);
+         *tmpNode = OS_MEM_NEXT_NODE(*tmpNode)) {
+        if (OS_MEM_NODE_GET_USED_FLAG((*tmpNode)->selfNode.sizeAndFlag)) {
+            if (!OS_MEM_MAGIC_VALID((*tmpNode)->selfNode.freeNodeInfo.pstPrev)) {
+                PRINT_ERR("[%s], %d, memory check error!\n"
+                          "memory used but magic num wrong, freeNodeInfo.pstPrev(magic num):%p \n",
+                          __FUNCTION__, __LINE__, (*tmpNode)->selfNode.freeNodeInfo.pstPrev);
+#ifdef LOSCFG_SHELL_EXCINFO_DUMP
+                WriteExcInfoToBuf("[%s], %d, memory check error!\n"
+                                  "memory used but magic num wrong, freeNodeInfo.pstPrev(magic num):%p \n",
+                                  __FUNCTION__, __LINE__, (*tmpNode)->selfNode.freeNodeInfo.pstPrev);
+#endif
+                return LOS_NOK;
+            }
+        } else { /* is free node, check free node range */
+            if (!OS_MEM_MIDDLE_ADDR_OPEN_END(pool, (*tmpNode)->selfNode.freeNodeInfo.pstPrev, endPool)) {
+                PRINT_ERR("[%s], %d, memory check error!\n"
+                          " freeNodeInfo.pstPrev:%p is out of legal mem range[%p, %p]\n",
+                          __FUNCTION__, __LINE__, (*tmpNode)->selfNode.freeNodeInfo.pstPrev, pool, endPool);
+#ifdef LOSCFG_SHELL_EXCINFO_DUMP
+                WriteExcInfoToBuf("[%s], %d, memory check error!\n"
+                                  " freeNodeInfo.pstPrev:%p is out of legal mem range[%p, %p]\n",
+                                  __FUNCTION__, __LINE__, (*tmpNode)->selfNode.freeNodeInfo.pstPrev, pool, endPool);
+#endif
+                return LOS_NOK;
+            }
+            if (!OS_MEM_MIDDLE_ADDR_OPEN_END(pool, (*tmpNode)->selfNode.freeNodeInfo.pstNext, endPool)) {
+                PRINT_ERR("[%s], %d, memory check error!\n"
+                          " freeNodeInfo.pstNext:%p is out of legal mem range[%p, %p]\n",
+                          __FUNCTION__, __LINE__, (*tmpNode)->selfNode.freeNodeInfo.pstNext, pool, endPool);
+#ifdef LOSCFG_SHELL_EXCINFO_DUMP
+                WriteExcInfoToBuf("[%s], %d, memory check error!\n"
+                                  " freeNodeInfo.pstNext:%p is out of legal mem range[%p, %p]\n",
+                                  __FUNCTION__, __LINE__, (*tmpNode)->selfNode.freeNodeInfo.pstNext, pool, endPool);
+#endif
+                return LOS_NOK;
+            }
+        }
+
+        *preNode = *tmpNode;
+    }
+    return LOS_OK;
+}
+
+STATIC VOID OsMemNodeInfo(const LosMemDynNode *tmpNode,
+                          const LosMemDynNode *preNode)
+{
+    if (tmpNode == preNode) {
+        PRINTK("\n the broken node is the first node\n");
+#ifdef LOSCFG_SHELL_EXCINFO_DUMP
+        WriteExcInfoToBuf("\n the broken node is the first node\n");
+#endif
+    }
+    PRINTK("\n broken node head: %p  %p  %p  0x%x, pre node head: %p  %p  %p  0x%x\n",
+           tmpNode->selfNode.freeNodeInfo.pstPrev, tmpNode->selfNode.freeNodeInfo.pstNext,
+           tmpNode->selfNode.preNode, tmpNode->selfNode.sizeAndFlag,
+           preNode->selfNode.freeNodeInfo.pstPrev, preNode->selfNode.freeNodeInfo.pstNext,
+           preNode->selfNode.preNode, preNode->selfNode.sizeAndFlag);
+
+#ifdef LOSCFG_SHELL_EXCINFO_DUMP
+    WriteExcInfoToBuf("\n broken node head: %p  %p  %p  0x%x, pre node head: %p  %p  %p  0x%x\n",
+                      tmpNode->selfNode.freeNodeInfo.pstPrev, tmpNode->selfNode.freeNodeInfo.pstNext,
+                      tmpNode->selfNode.preNode, tmpNode->selfNode.sizeAndFlag,
+                      preNode->selfNode.freeNodeInfo.pstPrev, preNode->selfNode.freeNodeInfo.pstNext,
+                      preNode->selfNode.preNode, preNode->selfNode.sizeAndFlag);
+#endif
+#ifdef LOSCFG_MEM_LEAKCHECK
+    OsMemNodeBacktraceInfo(tmpNode, preNode);
+#endif
+
+    PRINTK("\n---------------------------------------------\n");
+    UINTPTR dumpEnd = (((UINTPTR)tmpNode + NODEDUMPSIZE) > (UINTPTR)tmpNode) ?
+                      ((UINTPTR)tmpNode + NODEDUMPSIZE) : (UINTPTR)(UINTPTR_MAX);
+    UINT32 dumpSize = (UINTPTR)dumpEnd - (UINTPTR)tmpNode;
+    PRINTK(" dump mem tmpNode:%p ~ %p\n", tmpNode, dumpEnd);
+    OsDumpMemByte(dumpSize, (UINTPTR)tmpNode);
+    PRINTK("\n---------------------------------------------\n");
+    if (preNode != tmpNode) {
+        PRINTK(" dump mem :%p ~ tmpNode:%p\n", ((UINTPTR)tmpNode - NODEDUMPSIZE), tmpNode);
+        OsDumpMemByte(NODEDUMPSIZE, ((UINTPTR)tmpNode - NODEDUMPSIZE));
+        PRINTK("\n---------------------------------------------\n");
+    }
+}
+
+STATIC VOID OsMemIntegrityCheckError(const LosMemDynNode *tmpNode,
+                                     const LosMemDynNode *preNode)
+{
+    LosTaskCB *taskCB = NULL;
+    UINT32 taskId;
+
+    OsMemNodeInfo(tmpNode, preNode);
+
+    taskId = OS_MEM_TASKID_GET(preNode);
+    if (taskId >= g_taskMaxNum) {
+#ifdef LOSCFG_SHELL_EXCINFO_DUMP
+        WriteExcInfoToBuf("Task ID %u in pre node is invalid!\n", taskId);
+#endif
+        LOS_Panic("Task ID %u in pre node is invalid!\n", taskId);
+        return;
+    }
+
+    taskCB = OS_TCB_FROM_TID(taskId);
+    if ((taskCB->taskStatus & OS_TASK_STATUS_UNUSED) ||
+        (taskCB->taskEntry == NULL) || (taskCB->taskName == NULL)) {
+#ifdef LOSCFG_SHELL_EXCINFO_DUMP
+        WriteExcInfoToBuf("\r\nTask ID %u in pre node is not created or deleted!\n", taskId);
+#endif
+        LOS_Panic("\r\nTask ID %u in pre node is not created!\n", taskId);
+        return;
+    }
+#ifdef LOSCFG_SHELL_EXCINFO_DUMP
+    WriteExcInfoToBuf("cur node: %p\npre node: %p\npre node was allocated by task:%s\n",
+                      tmpNode, preNode, taskCB->taskName);
+#endif
+    LOS_Panic("cur node: %p\npre node: %p\npre node was allocated by task:%s\n",
+              tmpNode, preNode, taskCB->taskName);
+    return;
+}
+
+/*
+ * Description : memory pool integrity checking
+ * Input       : pool --Pointer to memory pool
+ * Return      : LOS_OK --memory pool integrate or LOS_NOK--memory pool impaired
+ */
+LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemIntegrityCheck(VOID *pool)
+{
+    LosMemDynNode *tmpNode = NULL;
+    LosMemDynNode *preNode = NULL;
+    UINT32 intSave;
+
+    if (pool == NULL) {
+        return LOS_NOK;
+    }
+
+    MEM_LOCK(intSave);
+    if (OsMemIntegrityCheck(pool, &tmpNode, &preNode)) {
+        goto ERROR_OUT;
+    }
+    MEM_UNLOCK(intSave);
     return LOS_OK;
 
-errout:
-    LOS_IntRestore(uvIntSave);
-    PRINT_ERR("<------- ERR Node Pre 0x%x byte\n", OS_EXC_ERR_NODE_RANGE);/*lint !e515 !e516*/
-    print_hex((unsigned int *)(pstTmpNode - OS_EXC_ERR_NODE_RANGE), OS_EXC_ERR_NODE_RANGE / 4);
-    PRINT_ERR("ERR Node Next 0x%x byte ------->\n", OS_EXC_ERR_NODE_RANGE);/*lint !e515 !e516*/
-    print_hex((unsigned int *)pstTmpNode, OS_EXC_ERR_NODE_RANGE / 4);
-    uwTaskID = (UINT32)(pstPreNode->stFreeNodeInfo.pstNext);
-    if (uwTaskID >= g_uwTskMaxNum)
-    {
-        LOS_Panic("Task ID %d in pre node is invalid!\n", uwTaskID);
-    }
-    pstTaskCB = OS_TCB_FROM_TID(uwTaskID);
-
-    if ((pstTaskCB->usTaskStatus & OS_TASK_STATUS_UNUSED) ||
-        (pstTaskCB->pfnTaskEntry == NULL) ||
-        (pstTaskCB->pcTaskName == NULL))
-    {
-        LOS_Panic("\r\nTask ID %d in pre node  is not created!\n", uwTaskID);
-    }
-    LOS_Panic("cur node: 0x%x\n"
-               "pre node: 0x%x\n"
-               "pre node was allocated by task:%s\n",
-               pstTmpNode, pstPreNode,  pstTaskCB->pcTaskName);/*lint !e515 !e516*/
+ERROR_OUT:
+    OsMemIntegrityCheckError(tmpNode, preNode);
+    MEM_UNLOCK(intSave);
     return LOS_NOK;
 }
 
-/*****************************************************************************
- Function : osMemAllocWithCheck
- Description : Allocate node from Memory pool
- Input       : pPool    --- Pointer to memory pool
-                 uwSize  --- Size of memory in bytes to allocate
- Output      : None
- Return      : Pointer to allocated memory
-*****************************************************************************/
-LITE_OS_SEC_TEXT STATIC_INLINE VOID *osMemAllocWithCheck(VOID *pPool, UINT32  uwSize)
+VOID OsMemIntegrityMultiCheck(VOID)
 {
-    LOS_MEM_DYN_NODE *pstAllocNode = (LOS_MEM_DYN_NODE *)NULL;
-    UINT32 uwAllocSize;
-
-    if (g_MALLOC_HOOK != NULL)
-        g_MALLOC_HOOK();
-
-#ifdef OS_MEM_ENABLE_ALLOC_CHECK
-    (VOID)LOS_MemIntegrityCheck(pPool);
+    if (LOS_MemIntegrityCheck(m_aucSysMem1) == LOS_OK) {
+        PRINTK("system memcheck over, all passed!\n");
+#ifdef LOSCFG_SHELL_EXCINFO_DUMP
+        WriteExcInfoToBuf("system memcheck over, all passed!\n");
 #endif
-
-    uwAllocSize = OS_MEM_ALIGN(uwSize + OS_MEM_NODE_HEAD_SIZE, OS_MEM_ALIGN_SIZE);
-    pstAllocNode = osMemFindSuitableFreeBlock(pPool, uwAllocSize);
-    if (pstAllocNode == NULL)
-    {
-        PRINT_ERR("[%s] No suitable free block\n", __FUNCTION__);/*lint !e515*/
-        return NULL;
     }
-    if ((uwAllocSize + OS_MEM_NODE_HEAD_SIZE + OS_MEM_ALIGN_SIZE) <= pstAllocNode->uwSizeAndFlag)
-    {
-        osMemSpitNode(pPool, pstAllocNode, uwAllocSize);
-    }
-    LOS_ListDelete(&(pstAllocNode->stFreeNodeInfo));
-    osMemSetMagicNumAndTaskid(pstAllocNode);
-    OS_MEM_NODE_SET_USED_FLAG(pstAllocNode->uwSizeAndFlag);
-#if (LOSCFG_MEM_TASK_USED_STATISTICS == YES)
-    OS_MEM_ADD_USED(OS_MEM_NODE_GET_SIZE(pstAllocNode->uwSizeAndFlag));
+#ifdef LOSCFG_EXC_INTERACTION
+    if (LOS_MemIntegrityCheck(m_aucSysMem0) == LOS_OK) {
+        PRINTK("exc interaction memcheck over, all passed!\n");
+#ifdef LOSCFG_SHELL_EXCINFO_DUMP
+        WriteExcInfoToBuf("exc interaction memcheck over, all passed!\n");
 #endif
-    return (pstAllocNode + 1);
-
+    }
+#endif
+}
+#else
+LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemIntegrityCheck(VOID *pool)
+{
+    return LOS_OK;
 }
 
-/*****************************************************************************
- Function : osMemReAllocSmaller
- Description : reAlloc a smaller memory node
- Input       : pPool    --- Pointer to memory pool
-                 uwAllocSize  --- the size of new node which will be alloced
-                 pstNode --the node which wille be realloced
-                 uwNodeSize -- the size of old node
- Output      : pstNode -- pointer to the new node after realloc
- Return      : None
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR STATIC_INLINE VOID osMemReAllocSmaller(VOID *pPool, UINT32 uwAllocSize, LOS_MEM_DYN_NODE *pstNode, UINT32 uwNodeSize)
+VOID OsMemIntegrityMultiCheck(VOID)
 {
-     if ((uwAllocSize + OS_MEM_NODE_HEAD_SIZE + OS_MEM_ALIGN_SIZE) <= uwNodeSize)
-     {
-         pstNode->uwSizeAndFlag = uwNodeSize;
-         osMemSpitNode(pPool, pstNode, uwAllocSize);
-         OS_MEM_NODE_SET_USED_FLAG(pstNode->uwSizeAndFlag);
-#if (LOSCFG_MEM_TASK_USED_STATISTICS == YES)
-         OS_MEM_REDUCE_USED(uwNodeSize - uwAllocSize);
+}
 #endif
-     }
+
+STATIC INLINE VOID OsMemNodeDebugOperate(VOID *pool, LosMemDynNode *allocNode, UINT32 size)
+{
+#ifdef LOSCFG_MEM_RECORDINFO
+    allocNode->selfNode.originSize = size;
+#endif
+
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+    OsMemNodeSave(allocNode);
+#endif
+
+#ifdef LOSCFG_MEM_LEAKCHECK
+    OsMemLinkRegisterRecord(allocNode);
+#endif
 }
 
-/*****************************************************************************
- Function : osMemMergeNodeForReAllocBigger
- Description : reAlloc a Bigger memory node after merge pstNode and nextNode
- Input       : pPool    --- Pointer to memory pool
-                 uwAllocSize  --- the size of new node which will be alloced
-                 pstNode --the node which wille be realloced
-                 uwNodeSize -- the size of old node
-                 pstNextNode -- pointer next node which will be merged
- Output      : pstNode -- pointer to the new node after realloc
- Return      : None
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR STATIC_INLINE VOID osMemMergeNodeForReAllocBigger(VOID *pPool, UINT32 uwAllocSize, LOS_MEM_DYN_NODE *pstNode, UINT32 uwNodeSize, LOS_MEM_DYN_NODE *pstNextNode)
+STATIC UINT32 OsMemInfoGet(const VOID *pool, LOS_MEM_POOL_STATUS *poolStatus)
 {
-    pstNode->uwSizeAndFlag = uwNodeSize;
-    LOS_ListDelete(&(pstNextNode->stFreeNodeInfo));
-    osMemMergeNode(pstNextNode);
-#if (LOSCFG_MEM_TASK_USED_STATISTICS == YES)
-    OS_MEM_ADD_USED(pstNode->uwSizeAndFlag - uwNodeSize);
-#endif
-    if ((uwAllocSize + OS_MEM_NODE_HEAD_SIZE + OS_MEM_ALIGN_SIZE) <= pstNode->uwSizeAndFlag)
-    {
-#if (LOSCFG_MEM_TASK_USED_STATISTICS == YES)
-        OS_MEM_REDUCE_USED(pstNode->uwSizeAndFlag - uwAllocSize);
-#endif
-        osMemSpitNode(pPool, pstNode, uwAllocSize);
-    }
-    OS_MEM_NODE_SET_USED_FLAG(pstNode->uwSizeAndFlag);
-}
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)pool;
+    LosMemDynNode *tmpNode = NULL;
+    UINT32 totalUsedSize = 0;
+    UINT32 totalFreeSize = 0;
+    UINT32 maxFreeNodeSize = 0;
+    UINT32 usedNodeNum = 0;
+    UINT32 freeNodeNum = 0;
 
-/*****************************************************************************
- Function : LOS_MemInit
- Description : Initialize Dynamic Memory pool
- Input       : pPool    --- Pointer to memory pool
-               uwSize   --- Size of memory in bytes to allocate
- Output      : None
- Return      : LOS_OK - Ok, LOS_NOK - Error
-*****************************************************************************/
-LITE_OS_SEC_TEXT_INIT UINT32 LOS_MemInit(VOID *pPool, UINT32  uwSize)
-{
-    LOS_MEM_DYN_NODE *pstNewNode = (LOS_MEM_DYN_NODE *)NULL;
-    LOS_MEM_DYN_NODE *pstEndNode = (LOS_MEM_DYN_NODE *)NULL;
-    LOS_MEM_POOL_INFO *pstPoolInfo = (LOS_MEM_POOL_INFO *)NULL;
-    UINTPTR uvIntSave;
-    LOS_DL_LIST *pstListHead = (LOS_DL_LIST *)NULL;
-
-    if ((pPool == NULL) || (uwSize < (OS_MEM_MIN_POOL_SIZE)))
-    {
+    tmpNode = (LosMemDynNode *)OS_MEM_END_NODE(pool, poolInfo->poolSize);
+    tmpNode = (LosMemDynNode *)OS_MEM_ALIGN(tmpNode, OS_MEM_ALIGN_SIZE);
+    if (!OS_MEM_MAGIC_VALID(tmpNode->selfNode.freeNodeInfo.pstPrev)) {
+        PRINT_ERR("wrong mem pool addr: %p\n, line:%d", poolInfo, __LINE__);
         return LOS_NOK;
     }
 
-    uvIntSave = LOS_IntLock();
-
-    pstPoolInfo = (LOS_MEM_POOL_INFO *)pPool;
-    pstPoolInfo->pPoolAddr = pPool;
-    pstPoolInfo->uwPoolSize = uwSize;
-    LOS_DLnkInitMultiHead(OS_MEM_HEAD_ADDR(pPool));
-    pstNewNode = OS_MEM_FIRST_NODE(pPool);
-    pstNewNode->uwSizeAndFlag = ((uwSize - ((UINT32)pstNewNode - (UINT32)pPool)) - OS_MEM_NODE_HEAD_SIZE);
-    pstNewNode->pstPreNode = (LOS_MEM_DYN_NODE *)NULL;
-    pstListHead = OS_MEM_HEAD(pPool, pstNewNode->uwSizeAndFlag);
-    if (NULL == pstListHead)
-    {
-        PRINT_ERR("%s %d\n", __FUNCTION__, __LINE__);
-        LOS_IntRestore(uvIntSave);
-        return LOS_NOK;
+    for (tmpNode = OS_MEM_FIRST_NODE(poolInfo); tmpNode <= OS_MEM_END_NODE(poolInfo, poolInfo->poolSize);
+         tmpNode = OS_MEM_NEXT_NODE(tmpNode)) {
+        if (!OS_MEM_NODE_GET_USED_FLAG(tmpNode->selfNode.sizeAndFlag)) {
+            ++freeNodeNum;
+            totalFreeSize += OS_MEM_NODE_GET_SIZE(tmpNode->selfNode.sizeAndFlag);
+            if (maxFreeNodeSize < OS_MEM_NODE_GET_SIZE(tmpNode->selfNode.sizeAndFlag)) {
+                maxFreeNodeSize = OS_MEM_NODE_GET_SIZE(tmpNode->selfNode.sizeAndFlag);
+            }
+        } else {
+            ++usedNodeNum;
+            totalUsedSize += OS_MEM_NODE_GET_SIZE(tmpNode->selfNode.sizeAndFlag);
+        }
     }
 
-    LOS_ListTailInsert(pstListHead,&(pstNewNode->stFreeNodeInfo));
-    pstEndNode = (LOS_MEM_DYN_NODE *)OS_MEM_END_NODE(pPool, uwSize);
-    memset(pstEndNode, 0 ,sizeof(*pstEndNode));
-    pstEndNode->pstPreNode = pstNewNode;
-    pstEndNode->uwSizeAndFlag = OS_MEM_NODE_HEAD_SIZE;
-    OS_MEM_NODE_SET_USED_FLAG(pstEndNode->uwSizeAndFlag);
-    osMemSetMagicNumAndTaskid(pstEndNode);
-    LOS_IntRestore(uvIntSave);
+    poolStatus->uwTotalUsedSize = totalUsedSize;
+    poolStatus->uwTotalFreeSize = totalFreeSize;
+    poolStatus->uwMaxFreeNodeSize = maxFreeNodeSize;
+    poolStatus->uwUsedNodeNum = usedNodeNum;
+    poolStatus->uwFreeNodeNum = freeNodeNum;
+#ifdef LOSCFG_MEM_TASK_STAT
+    poolStatus->uwUsageWaterLine = poolInfo->stat.memTotalPeak;
+#endif
 
     return LOS_OK;
 }
 
-/*****************************************************************************
- Function : LOS_MemAlloc
- Description : Allocate Memory from Memory pool
- Input       : pPool    --- Pointer to memory pool
-               uwSize   --- Size of memory in bytes to allocate
- Output      : None
- Return      : Pointer to allocated memory
-*****************************************************************************/
-LITE_OS_SEC_TEXT VOID *LOS_MemAlloc (VOID *pPool, UINT32  uwSize)
+VOID OsMemInfoPrint(const VOID *pool)
 {
-    VOID *pPtr = NULL;
-    UINTPTR uvIntSave = LOS_IntLock();
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)pool;
+    LOS_MEM_POOL_STATUS status = {0};
 
-    do
-    {
-        if ((pPool == NULL) || (uwSize == 0))
-        {
-            break;
-        }
+    if (OsMemInfoGet(pool, &status) == LOS_NOK) {
+        return;
+    }
 
-        if (OS_MEM_NODE_GET_USED_FLAG(uwSize))
-        {
-            break;
-        }
+#ifdef LOSCFG_MEM_TASK_STAT
+    PRINTK("pool addr          pool size    used size     free size    "
+           "max free node size   used node num     free node num      UsageWaterLine\n");
+    PRINTK("---------------    --------     -------       --------     "
+           "--------------       -------------      ------------      ------------\n");
+    PRINTK("%-16p   0x%-8x   0x%-8x    0x%-8x   0x%-16x   0x%-13x    0x%-13x    0x%-13x\n",
+           poolInfo->pool, poolInfo->poolSize, status.uwTotalUsedSize,
+           status.uwTotalFreeSize, status.uwMaxFreeNodeSize, status.uwUsedNodeNum,
+           status.uwFreeNodeNum, status.uwUsageWaterLine);
 
-        pPtr = osMemAllocWithCheck(pPool, uwSize);
-    } while (0);
-
-    LOS_IntRestore(uvIntSave);
-    return pPtr;
+#else
+    PRINTK("pool addr          pool size    used size     free size    "
+           "max free node size   used node num     free node num\n");
+    PRINTK("---------------    --------     -------       --------     "
+           "--------------       -------------      ------------\n");
+    PRINTK("%-16p   0x%-8x   0x%-8x    0x%-8x   0x%-16x   0x%-13x    0x%-13x\n",
+           poolInfo->pool, poolInfo->poolSize, status.uwTotalUsedSize,
+           status.uwTotalFreeSize, status.uwMaxFreeNodeSize, status.uwUsedNodeNum,
+           status.uwFreeNodeNum);
+#endif
 }
 
-/*****************************************************************************
- Function : LOS_MemAllocAlign
- Description : align size then allocate node from Memory pool
- Input       : pPool        --- Pointer to memory pool
-               uwSize       --- Size of memory in bytes to allocate
-               uwBoundary   --- align form
- Output      : None
- Return      : Pointer to allocated memory node
-*****************************************************************************/
-LITE_OS_SEC_TEXT VOID *LOS_MemAllocAlign(VOID *pPool, UINT32 uwSize, UINT32 uwBoundary)
+STATIC INLINE VOID OsMemInfoAlert(const VOID *pool, UINT32 allocSize)
 {
-    UINT32 uwUseSize = 0;
-    UINT32 uwGapSize = 0;
-    VOID *pPtr = NULL;
-    VOID *pAlignedPtr = NULL;
-    UINTPTR uvIntSave = LOS_IntLock();
+#ifdef LOSCFG_MEM_DEBUG
+    PRINT_ERR("---------------------------------------------------"
+              "--------------------------------------------------------\n");
+    OsMemInfoPrint(pool);
+    PRINT_ERR("[%s] No suitable free block, require free node size: 0x%x\n", __FUNCTION__, allocSize);
+    PRINT_ERR("----------------------------------------------------"
+              "-------------------------------------------------------\n");
+#endif
+}
 
-    do
-    {
-        if ((pPool == NULL) || (uwSize == 0))
-        {
+/*
+ * Description : Allocate node from Memory pool
+ * Input       : pool  --- Pointer to memory pool
+ *               size  --- Size of memory in bytes to allocate
+ * Return      : Pointer to allocated memory
+ */
+STATIC VOID *OsMemAllocWithCheck(LosMemPoolInfo *pool, UINT32 size)
+{
+    LosMemDynNode *allocNode = NULL;
+    UINT32 allocSize;
+
+#ifdef LOSCFG_BASE_MEM_NODE_INTEGRITY_CHECK
+    LosMemDynNode *tmpNode = NULL;
+    LosMemDynNode *preNode = NULL;
+#endif
+    const VOID *firstNode = (const VOID *)((UINT8 *)OS_MEM_HEAD_ADDR(pool) + OS_DLNK_HEAD_SIZE);
+
+#ifdef LOSCFG_BASE_MEM_NODE_INTEGRITY_CHECK
+    if (OsMemIntegrityCheck(pool, &tmpNode, &preNode)) {
+        OsMemIntegrityCheckError(tmpNode, preNode);
+        return NULL;
+    }
+#endif
+
+    allocSize = OS_MEM_ALIGN(size + OS_MEM_NODE_HEAD_SIZE, OS_MEM_ALIGN_SIZE);
+    allocNode = OsMemFindSuitableFreeBlock(pool, allocSize);
+    if (allocNode == NULL) {
+        OsMemInfoAlert(pool, allocSize);
+        return NULL;
+    }
+    if ((allocSize + OS_MEM_NODE_HEAD_SIZE + OS_MEM_ALIGN_SIZE) <= allocNode->selfNode.sizeAndFlag) {
+        OsMemSplitNode(pool, allocNode, allocSize);
+    }
+    OsMemListDelete(&allocNode->selfNode.freeNodeInfo, firstNode);
+    OsMemSetMagicNumAndTaskID(allocNode);
+    OS_MEM_NODE_SET_USED_FLAG(allocNode->selfNode.sizeAndFlag);
+    OS_MEM_ADD_USED(&pool->stat, OS_MEM_NODE_GET_SIZE(allocNode->selfNode.sizeAndFlag),
+                    OS_MEM_TASKID_GET(allocNode));
+    OsMemNodeDebugOperate(pool, allocNode, size);
+    return (allocNode + 1);
+}
+
+/*
+ * Description : reAlloc a smaller memory node
+ * Input       : pool      --- Pointer to memory pool
+ *               allocSize --- the size of new node which will be alloced
+ *               node      --- the node which will be realloced
+ *               nodeSize  --- the size of old node
+ * Output      : node      --- pointer to the new node after realloc
+ */
+STATIC INLINE VOID OsMemReAllocSmaller(LosMemPoolInfo *pool, UINT32 allocSize, LosMemDynNode *node, UINT32 nodeSize)
+{
+    if ((allocSize + OS_MEM_NODE_HEAD_SIZE + OS_MEM_ALIGN_SIZE) <= nodeSize) {
+        node->selfNode.sizeAndFlag = nodeSize;
+        OsMemSplitNode(pool, node, allocSize);
+        OS_MEM_NODE_SET_USED_FLAG(node->selfNode.sizeAndFlag);
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+        OsMemNodeSave(node);
+#endif
+
+        OS_MEM_REDUCE_USED(&pool->stat, nodeSize - allocSize, OS_MEM_TASKID_GET(node));
+    }
+#ifdef LOSCFG_MEM_LEAKCHECK
+    OsMemLinkRegisterRecord(node);
+#endif
+}
+
+/*
+ * Description : reAlloc a Bigger memory node after merge node and nextNode
+ * Input       : pool      --- Pointer to memory pool
+ *               allocSize --- the size of new node which will be alloced
+ *               node      --- the node which will be realloced
+ *               nodeSize  --- the size of old node
+ *               nextNode  --- pointer next node which will be merged
+ * Output      : node      --- pointer to the new node after realloc
+ */
+STATIC INLINE VOID OsMemMergeNodeForReAllocBigger(LosMemPoolInfo *pool, UINT32 allocSize, LosMemDynNode *node,
+                                                  UINT32 nodeSize, LosMemDynNode *nextNode)
+{
+    const VOID *firstNode = (const VOID *)((UINT8 *)OS_MEM_HEAD_ADDR(pool) + OS_DLNK_HEAD_SIZE);
+
+    node->selfNode.sizeAndFlag = nodeSize;
+    OsMemListDelete(&nextNode->selfNode.freeNodeInfo, firstNode);
+    OsMemMergeNode(nextNode);
+    if ((allocSize + OS_MEM_NODE_HEAD_SIZE + OS_MEM_ALIGN_SIZE) <= node->selfNode.sizeAndFlag) {
+        OsMemSplitNode(pool, node, allocSize);
+    }
+
+    OS_MEM_ADD_USED(&pool->stat, node->selfNode.sizeAndFlag - nodeSize, OS_MEM_TASKID_GET(node));
+
+    OS_MEM_NODE_SET_USED_FLAG(node->selfNode.sizeAndFlag);
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+    OsMemNodeSave(node);
+#endif
+#ifdef LOSCFG_MEM_LEAKCHECK
+    OsMemLinkRegisterRecord(node);
+#endif
+}
+
+STATIC UINT32 OsMemInit(VOID *pool, UINT32 size)
+{
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)pool;
+    LosMemDynNode *newNode = NULL;
+    LosMemDynNode *endNode = NULL;
+    LOS_DL_LIST *listNodeHead = NULL;
+    UINT32 poolSize = OsLmsMemInit(pool, size);
+    if (poolSize == 0) {
+        poolSize = size;
+    }
+    poolInfo->pool = pool;
+    poolInfo->poolSize = poolSize;
+    OsDLnkInitMultiHead(OS_MEM_HEAD_ADDR(pool));
+    newNode = OS_MEM_FIRST_NODE(pool);
+    newNode->selfNode.sizeAndFlag = (poolSize - (UINT32)((UINTPTR)newNode - (UINTPTR)pool) - OS_MEM_NODE_HEAD_SIZE);
+    newNode->selfNode.preNode = (LosMemDynNode *)OS_MEM_END_NODE(pool, poolSize);
+    listNodeHead = OS_MEM_HEAD(pool, newNode->selfNode.sizeAndFlag);
+    if (listNodeHead == NULL) {
+        return LOS_NOK;
+    }
+
+    LOS_ListTailInsert(listNodeHead, &(newNode->selfNode.freeNodeInfo));
+    endNode = (LosMemDynNode *)OS_MEM_END_NODE(pool, poolSize);
+    (VOID)memset_s(endNode, sizeof(*endNode), 0, sizeof(*endNode));
+    endNode->selfNode.preNode = newNode;
+    endNode->selfNode.sizeAndFlag = OS_MEM_NODE_HEAD_SIZE;
+    OS_MEM_NODE_SET_USED_FLAG(endNode->selfNode.sizeAndFlag);
+    OsMemSetMagicNumAndTaskID(endNode);
+#ifdef LOSCFG_MEM_TASK_STAT
+    UINT32 statSize = sizeof(poolInfo->stat);
+    (VOID)memset_s(&poolInfo->stat, statSize, 0, statSize);
+    poolInfo->stat.memTotalUsed = sizeof(LosMemPoolInfo) + OS_MULTI_DLNK_HEAD_SIZE +
+                                  OS_MEM_NODE_GET_SIZE(endNode->selfNode.sizeAndFlag);
+    poolInfo->stat.memTotalPeak = poolInfo->stat.memTotalUsed;
+#endif
+
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+    OsMemNodeSave(newNode);
+    OsMemNodeSave(endNode);
+#endif
+
+    return LOS_OK;
+}
+
+LITE_OS_SEC_TEXT_INIT UINT32 LOS_MemInit(VOID *pool, UINT32 size)
+{
+    UINT32 intSave;
+
+    if ((pool == NULL) || (size < OS_MEM_MIN_POOL_SIZE)) {
+        return LOS_NOK;
+    }
+
+    if (!IS_ALIGNED(size, OS_MEM_ALIGN_SIZE) || !IS_ALIGNED(pool, OS_MEM_ALIGN_SIZE)) {
+        PRINT_WARN("pool [%p, %p) size 0x%x should be aligned with OS_MEM_ALIGN_SIZE\n",
+                   pool, (UINTPTR)pool + size, size);
+        size = OS_MEM_ALIGN(size, OS_MEM_ALIGN_SIZE) - OS_MEM_ALIGN_SIZE;
+    }
+
+    MEM_LOCK(intSave);
+    if (OsMemMulPoolInit(pool, size)) {
+        MEM_UNLOCK(intSave);
+        return LOS_NOK;
+    }
+
+    if (OsMemInit(pool, size) != LOS_OK) {
+        (VOID)OsMemMulPoolDeinit(pool);
+        MEM_UNLOCK(intSave);
+        return LOS_NOK;
+    }
+
+    OsSlabMemInit(pool, size);
+    MEM_UNLOCK(intSave);
+
+    LOS_TRACE(MEM_INFO_REQ, pool);
+    return LOS_OK;
+}
+
+LITE_OS_SEC_TEXT VOID *LOS_MemAlloc(VOID *pool, UINT32 size)
+{
+    VOID *ptr = NULL;
+    UINT32 intSave;
+
+    if ((pool == NULL) || (size == 0)) {
+        return NULL;
+    }
+
+    if (g_MALLOC_HOOK != NULL) {
+        g_MALLOC_HOOK();
+    }
+
+    MEM_LOCK(intSave);
+    do {
+        if (OS_MEM_NODE_GET_USED_FLAG(size) || OS_MEM_NODE_GET_ALIGNED_FLAG(size)) {
             break;
         }
 
-        uwUseSize = uwSize + uwBoundary + 4; /* 4bytes stores offset between alignedPtr and ptr */
+        ptr = OsSlabMemAlloc(pool, size);
+        if (ptr == NULL) {
+            ptr = OsMemAllocWithCheck(pool, size);
+        }
+    } while (0);
+#ifdef LOSCFG_MEM_RECORDINFO
+    OsMemRecordMalloc(ptr, size);
+#endif
+    OsLmsSetAfterMalloc(ptr);
 
-        if (OS_MEM_NODE_GET_USED_FLAG(uwUseSize))
-        {
+    MEM_UNLOCK(intSave);
+
+    LOS_TRACE(MEM_ALLOC, pool, (UINTPTR)ptr, size);
+    return ptr;
+}
+
+LITE_OS_SEC_TEXT VOID *LOS_MemAllocAlign(VOID *pool, UINT32 size, UINT32 boundary)
+{
+    UINT32 useSize;
+    UINT32 gapSize;
+    VOID *ptr = NULL;
+    VOID *alignedPtr = NULL;
+    LosMemDynNode *allocNode = NULL;
+    UINT32 intSave;
+
+    if ((pool == NULL) || (size == 0) || (boundary == 0) || !IS_POW_TWO(boundary) ||
+        !IS_ALIGNED(boundary, sizeof(VOID *))) {
+        return NULL;
+    }
+
+    MEM_LOCK(intSave);
+    do {
+        /*
+         * sizeof(gapSize) bytes stores offset between alignedPtr and ptr,
+         * the ptr has been OS_MEM_ALIGN_SIZE(4 or 8) aligned, so maximum
+         * offset between alignedPtr and ptr is boundary - OS_MEM_ALIGN_SIZE
+         */
+        if ((boundary - sizeof(gapSize)) > ((UINT32)(-1) - size)) {
             break;
         }
 
-        pPtr = osMemAllocWithCheck(pPool, uwUseSize);
+        useSize = (size + boundary) - sizeof(gapSize);
+        if (OS_MEM_NODE_GET_USED_FLAG(useSize) || OS_MEM_NODE_GET_ALIGNED_FLAG(useSize)) {
+            break;
+        }
 
-        pAlignedPtr = (VOID *)OS_MEM_ALIGN(pPtr, uwBoundary);
+        ptr = OsMemAllocWithCheck(pool, useSize);
 
-        if (pPtr == pAlignedPtr)
-        {
+        alignedPtr = (VOID *)OS_MEM_ALIGN(ptr, boundary);
+        if (ptr == alignedPtr) {
             break;
         }
 
         /* store gapSize in address (ptr -4), it will be checked while free */
-        uwGapSize = (UINT32)pAlignedPtr - (UINT32)pPtr;
-        OS_MEM_NODE_SET_ALIGNED_FLAG(uwGapSize);
-        *((UINT32 *)((UINT32)pAlignedPtr - 4)) = uwGapSize;
+        gapSize = (UINT32)((UINTPTR)alignedPtr - (UINTPTR)ptr);
+        allocNode = (LosMemDynNode *)ptr - 1;
+        OS_MEM_NODE_SET_ALIGNED_FLAG(allocNode->selfNode.sizeAndFlag);
+#ifdef LOSCFG_MEM_RECORDINFO
+        allocNode->selfNode.originSize = size;
+#endif
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+        OsMemNodeSaveWithGapSize(allocNode, gapSize);
+#endif
 
-        pPtr = pAlignedPtr;
+        OS_MEM_NODE_SET_ALIGNED_FLAG(gapSize);
+        *(UINT32 *)((UINTPTR)alignedPtr - sizeof(gapSize)) = gapSize;
 
+        ptr = alignedPtr;
     } while (0);
+#ifdef LOSCFG_MEM_RECORDINFO
+    OsMemRecordMalloc(ptr, size);
+#endif
+    OsLmsSetAfterMalloc(ptr);
 
-     LOS_IntRestore(uvIntSave);
+    MEM_UNLOCK(intSave);
 
-    return pPtr;
+    LOS_TRACE(MEM_ALLOC_ALIGN, pool, (UINTPTR)ptr, size, boundary);
+    return ptr;
 }
 
-/*****************************************************************************
- Function : LOS_MemFree
- Description : Free Memory and return it to Memory pool
- Input       : pPool    --- Pointer to memory pool
-               pMem     --- Pointer to memory to free
- Output      : None
- Return      : LOS_OK - OK, LOS_NOK - Error
-*****************************************************************************/
-LITE_OS_SEC_TEXT UINT32 LOS_MemFree(VOID *pPool, VOID *pMem)
+LITE_OS_SEC_TEXT STATIC INLINE UINT32 OsDoMemFree(VOID *pool, const VOID *ptr, LosMemDynNode *node)
 {
-    UINT32 uwRet = LOS_NOK;
-    UINT32 uwGapSize = 0;
-    UINTPTR uvIntSave = LOS_IntLock();
-
-    do
-    {
-        LOS_MEM_DYN_NODE *pstNode = (LOS_MEM_DYN_NODE *)NULL;
-
-        if ((pPool == NULL) || (pMem == NULL))
-        {
-            break;
-        }
-
-        uwGapSize = *((UINT32 *)((UINT32)pMem - 4));
-        if (OS_MEM_NODE_GET_ALIGNED_FLAG(uwGapSize))
-        {
-            uwGapSize = OS_MEM_NODE_GET_ALIGNED_GAPSIZE(uwGapSize);
-            pMem = (VOID *)((UINT32)pMem - uwGapSize);
-        }
-
-        pstNode = (LOS_MEM_DYN_NODE *)((UINT32)pMem - OS_MEM_NODE_HEAD_SIZE);
-        uwRet = osMemCheckUsedNode(pPool, pstNode);
-        if (uwRet == LOS_OK)
-        {
-            osMemFreeNode(pstNode, pPool);
-        }
-
-    } while(0);
-
-    LOS_IntRestore(uvIntSave);
-    return uwRet;
+    UINT32 ret = OsMemCheckUsedNode(pool, node);
+    if (ret == LOS_OK) {
+#ifdef LOSCFG_MEM_RECORDINFO
+        OsMemRecordFree(ptr, node->selfNode.originSize);
+#endif
+        OsMemFreeNode(node, pool);
+    }
+    return ret;
 }
 
-/*****************************************************************************
- Function : LOS_MemRealloc
- Description : realloc memory from Memory pool
- Input       : pPool    --- Pointer to memory pool
-               pPtr     --- Pointer to memory
-               uwSize   --- new size
- Output      : None
- Return      : Pointer to allocated memory node
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR VOID *LOS_MemRealloc (VOID *pPool,  VOID *pPtr, UINT32 uwSize)
+UINT32 OsMemFree(VOID *pool, VOID *ptr)
 {
-    UINTPTR uvIntSave;
-    UINT32 uwGapSize = 0;
-    VOID *pNewPtr = NULL;
+    UINT32 ret = LOS_NOK;
+    UINT32 gapSize;
+    LosMemDynNode *node = NULL;
 
-    if((int)uwSize < 0)
+    do {
+        gapSize = *(UINT32 *)((UINTPTR)ptr - sizeof(UINT32));
+        if (OS_MEM_NODE_GET_ALIGNED_FLAG(gapSize) && OS_MEM_NODE_GET_USED_FLAG(gapSize)) {
+            PRINT_ERR("[%s:%d]gapSize:0x%x error\n", __FUNCTION__, __LINE__, gapSize);
+            goto OUT;
+        }
+
+        node = (LosMemDynNode *)((UINTPTR)ptr - OS_MEM_NODE_HEAD_SIZE);
+
+        if (OS_MEM_NODE_GET_ALIGNED_FLAG(gapSize)) {
+            gapSize = OS_MEM_NODE_GET_ALIGNED_GAPSIZE(gapSize);
+            if ((gapSize & (OS_MEM_ALIGN_SIZE - 1)) || (gapSize > ((UINTPTR)ptr - OS_MEM_NODE_HEAD_SIZE))) {
+                PRINT_ERR("illegal gapSize: 0x%x\n", gapSize);
+                break;
+            }
+            node = (LosMemDynNode *)((UINTPTR)ptr - gapSize - OS_MEM_NODE_HEAD_SIZE);
+        }
+#ifndef LOSCFG_MEM_HEAD_BACKUP
+        ret = OsDoMemFree(pool, ptr, node);
+#endif
+    } while (0);
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+    ret = OsMemBackupCheckAndRetore(pool, ptr, node);
+    if (!ret) {
+        ret = OsDoMemFree(pool, ptr, node);
+    }
+#endif
+
+OUT:
+#ifdef LOSCFG_MEM_RECORDINFO
+    if (ret == LOS_NOK) {
+        OsMemRecordFree(ptr, 0);
+    }
+#endif
+    return ret;
+}
+
+LITE_OS_SEC_TEXT UINT32 LOS_MemFree(VOID *pool, VOID *ptr)
+{
+    UINT32 ret;
+    UINT32 intSave;
+
+    if ((pool == NULL) || (ptr == NULL) ||
+        !IS_ALIGNED(pool, sizeof(VOID *)) || !IS_ALIGNED(ptr, sizeof(VOID *))) {
+        return LOS_NOK;
+    }
+
+    MEM_LOCK(intSave);
+
+    if (OsSlabMemFree(pool, ptr)) {
+        ret = LOS_OK;
+        goto OUT;
+    }
+
+    ret = OsMemFree(pool, ptr);
+OUT:
+    OsLmsSetAfterFree(ptr);
+    MEM_UNLOCK(intSave);
+
+    LOS_TRACE(MEM_FREE, pool, (UINTPTR)ptr);
+    return ret;
+}
+
+STATIC VOID *OsGetRealPtr(const VOID *pool, VOID *ptr)
+{
+    VOID *realPtr = ptr;
+    UINT32 gapSize = *((UINT32 *)((UINTPTR)ptr - sizeof(UINT32)));
+
+    if (OS_MEM_NODE_GET_ALIGNED_FLAG(gapSize) && OS_MEM_NODE_GET_USED_FLAG(gapSize)) {
+#ifdef LOSCFG_MEM_RECORDINFO
+        OsMemRecordFree(ptr, 0);
+#endif
+        PRINT_ERR("[%s:%d]gapSize:0x%x error\n", __FUNCTION__, __LINE__, gapSize);
         return NULL;
-
-    uvIntSave = LOS_IntLock();
-
-    do
-    {
-        LOS_MEM_DYN_NODE *pstNode = (LOS_MEM_DYN_NODE *)NULL;
-        UINT32 uwRet;
-        UINT32 uwAllocSize;
-        UINT32 uwNodeSize;
-        LOS_MEM_DYN_NODE *pstNextNode = (LOS_MEM_DYN_NODE *)NULL;
-
-        if (pPtr == NULL)
-        {
-            pNewPtr = LOS_MemAlloc((VOID *)pPool, (UINT32)uwSize);
-            break;
+    }
+    if (OS_MEM_NODE_GET_ALIGNED_FLAG(gapSize)) {
+        gapSize = OS_MEM_NODE_GET_ALIGNED_GAPSIZE(gapSize);
+        if ((gapSize & (OS_MEM_ALIGN_SIZE - 1)) ||
+            (gapSize > ((UINTPTR)ptr - OS_MEM_NODE_HEAD_SIZE - (UINTPTR)pool))) {
+            PRINT_ERR("[%s:%d]gapSize:0x%x error\n", __FUNCTION__, __LINE__, gapSize);
+#ifdef LOSCFG_MEM_RECORDINFO
+            OsMemRecordFree(ptr, 0);
+#endif
+            return NULL;
         }
-
-        if (uwSize == 0)
-        {
-            if (LOS_MemFree((VOID *)pPool, (VOID *)pPtr) != LOS_OK)
-                 PRINT_ERR("%s, %d\n", __FUNCTION__, __LINE__);
-            break;
-        }
-
-        uwGapSize = *((UINT32 *)((UINT32)pPtr - 4));
-        if (OS_MEM_NODE_GET_ALIGNED_FLAG(uwGapSize))
-        {
-            uwGapSize = OS_MEM_NODE_GET_ALIGNED_GAPSIZE(uwGapSize);
-            pPtr = (VOID *)((UINT32)pPtr - uwGapSize);
-        }
-        pstNode = (LOS_MEM_DYN_NODE *)((UINT32)pPtr - OS_MEM_NODE_HEAD_SIZE);
-        uwRet = osMemCheckUsedNode(pPool, pstNode);
-        if (uwRet != LOS_OK)
-        {
-            break;
-        }
-
-        uwAllocSize = OS_MEM_ALIGN(uwSize + OS_MEM_NODE_HEAD_SIZE, OS_MEM_ALIGN_SIZE);
-        uwNodeSize = OS_MEM_NODE_GET_SIZE(pstNode->uwSizeAndFlag);
-        if (uwNodeSize >= uwAllocSize)
-        {
-            osMemReAllocSmaller(pPool, uwAllocSize, pstNode, uwNodeSize);
-            pNewPtr = pPtr;
-            break;
-        }
-
-        pstNextNode = OS_MEM_NEXT_NODE(pstNode);
-        if ((!OS_MEM_NODE_GET_USED_FLAG(pstNextNode->uwSizeAndFlag)) &&
-            ((pstNextNode->uwSizeAndFlag + uwNodeSize) >= uwAllocSize))
-        {
-            osMemMergeNodeForReAllocBigger(pPool, uwAllocSize, pstNode, uwNodeSize, pstNextNode);
-            pNewPtr = pPtr;
-            break;
-        }
-
-        pNewPtr = osMemAllocWithCheck(pPool, uwSize);
-        if (pNewPtr != NULL)
-        {
-            memcpy(pNewPtr, pPtr, uwNodeSize - OS_MEM_NODE_HEAD_SIZE);
-            osMemFreeNode(pstNode, pPool);
-        }
-
-    } while (0);
-
-    LOS_IntRestore(uvIntSave);
-    return pNewPtr;
+        realPtr = (VOID *)((UINTPTR)ptr - (UINTPTR)gapSize);
+    }
+    return realPtr;
 }
 
-/*****************************************************************************
- Function : LOS_MemTotalUsedGet
- Description : figure the pointer memory pool for it's total mem used
- Input       : pPool    --- Pointer to memory pool
- Output      : None
- Return      : the size of the pool has been used
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemTotalUsedGet(VOID *pPool)
+STATIC VOID *OsMemRealloc(VOID *pool, VOID *ptr, UINT32 size)
 {
-    LOS_MEM_DYN_NODE *pstTmpNode = (LOS_MEM_DYN_NODE *)NULL;
-    LOS_MEM_POOL_INFO *pstPoolInfo = (LOS_MEM_POOL_INFO *)pPool;
-    UINT32 uwMemUsed = 0;
-    UINTPTR uvIntSave;
+    LosMemDynNode *node = NULL;
+    LosMemDynNode *nextNode = NULL;
+    VOID *tmpPtr = NULL;
+    VOID *realPtr = NULL;
+    UINT32 nodeSize;
+    UINT32 allocSize = OS_MEM_ALIGN(size + OS_MEM_NODE_HEAD_SIZE, OS_MEM_ALIGN_SIZE);
+#ifdef LOSCFG_MEM_RECORDINFO
+    const VOID *originPtr = ptr;
+#endif
 
-    if (pPool == NULL)
-    {
+    realPtr = OsGetRealPtr(pool, ptr);
+    if (realPtr == NULL) {
+        return NULL;
+    }
+
+    node = (LosMemDynNode *)((UINTPTR)realPtr - OS_MEM_NODE_HEAD_SIZE);
+    if (OsMemCheckUsedNode(pool, node) != LOS_OK) {
+#ifdef LOSCFG_MEM_RECORDINFO
+        OsMemRecordFree(originPtr, 0);
+#endif
+        return NULL;
+    }
+
+    nodeSize = OS_MEM_NODE_GET_SIZE(node->selfNode.sizeAndFlag);
+    if (nodeSize >= allocSize) {
+#ifdef LOSCFG_MEM_RECORDINFO
+        OsMemRecordFree(originPtr, node->selfNode.originSize);
+#endif
+        OsMemReAllocSmaller(pool, allocSize, node, nodeSize);
+#ifdef LOSCFG_MEM_RECORDINFO
+        OsMemReallocNodeRecord(node, size, ptr);
+#endif
+        return (VOID *)ptr;
+    }
+
+    nextNode = OS_MEM_NEXT_NODE(node);
+    if (!OS_MEM_NODE_GET_USED_FLAG(nextNode->selfNode.sizeAndFlag) &&
+        ((nextNode->selfNode.sizeAndFlag + nodeSize) >= allocSize)) {
+#ifdef LOSCFG_MEM_RECORDINFO
+        OsMemRecordFree(originPtr, node->selfNode.originSize);
+#endif
+        OsMemMergeNodeForReAllocBigger(pool, allocSize, node, nodeSize, nextNode);
+#ifdef LOSCFG_MEM_RECORDINFO
+        OsMemReallocNodeRecord(node, size, ptr);
+#endif
+        return (VOID *)ptr;
+    }
+
+    tmpPtr = OsMemAllocWithCheck(pool, size);
+    if (tmpPtr != NULL) {
+#ifdef LOSCFG_MEM_RECORDINFO
+        OsMemRecordMalloc(tmpPtr, size);
+#endif
+        UINT32 gapSize = (UINT32)((UINTPTR)ptr - (UINTPTR)realPtr);
+        if (memcpy_s(tmpPtr, size, ptr, (nodeSize - OS_MEM_NODE_HEAD_SIZE - gapSize)) != EOK) {
+            (VOID)OsMemFree((VOID *)pool, (VOID *)tmpPtr);
+            return NULL;
+        }
+#ifdef LOSCFG_MEM_RECORDINFO
+        OsMemRecordFree(originPtr, node->selfNode.originSize);
+#endif
+        OsMemFreeNode(node, pool);
+    }
+    return tmpPtr;
+}
+
+LITE_OS_SEC_TEXT_MINOR VOID *LOS_MemRealloc(VOID *pool, VOID *ptr, UINT32 size)
+{
+    UINT32 intSave;
+    VOID *newPtr = NULL;
+    BOOL isSlabMem = FALSE;
+
+    if (OS_MEM_NODE_GET_USED_FLAG(size) || OS_MEM_NODE_GET_ALIGNED_FLAG(size) || (pool == NULL)) {
+        return NULL;
+    }
+
+    if (ptr == NULL) {
+        newPtr = LOS_MemAlloc(pool, size);
+        goto OUT;
+    }
+
+    if (size == 0) {
+        (VOID)LOS_MemFree(pool, ptr);
+        goto OUT;
+    }
+
+    MEM_LOCK(intSave);
+
+    newPtr = OsMemReallocSlab(pool, ptr, &isSlabMem, size);
+    if (isSlabMem == TRUE) {
+        goto OUT_UNLOCK;
+    }
+
+    newPtr = OsMemRealloc(pool, ptr, size);
+
+OUT_UNLOCK:
+    MEM_UNLOCK(intSave);
+OUT:
+
+    LOS_TRACE(MEM_REALLOC, pool, (UINTPTR)ptr, size);
+    return newPtr;
+}
+
+LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemTotalUsedGet(VOID *pool)
+{
+    LosMemDynNode *tmpNode = NULL;
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)pool;
+    UINT32 memUsed = 0;
+    UINT32 intSave;
+
+    if (pool == NULL) {
         return LOS_NOK;
     }
 
-    uvIntSave = LOS_IntLock();
+    MEM_LOCK(intSave);
 
-    for (pstTmpNode = OS_MEM_FIRST_NODE(pPool); pstTmpNode <= OS_MEM_END_NODE(pPool, pstPoolInfo->uwPoolSize);
-        pstTmpNode = OS_MEM_NEXT_NODE(pstTmpNode))
-    {
-        if (OS_MEM_NODE_GET_USED_FLAG(pstTmpNode->uwSizeAndFlag))
-        {
-            uwMemUsed += OS_MEM_NODE_GET_SIZE(pstTmpNode->uwSizeAndFlag);
+    for (tmpNode = OS_MEM_FIRST_NODE(pool); tmpNode <= OS_MEM_END_NODE(pool, poolInfo->poolSize);
+         tmpNode = OS_MEM_NEXT_NODE(tmpNode)) {
+        if (OS_MEM_NODE_GET_USED_FLAG(tmpNode->selfNode.sizeAndFlag)) {
+            memUsed += OS_MEM_NODE_GET_SIZE(tmpNode->selfNode.sizeAndFlag);
         }
     }
 
-    LOS_IntRestore(uvIntSave);
+    MEM_UNLOCK(intSave);
 
-    return uwMemUsed;
+    return memUsed;
 }
 
-/*****************************************************************************
- Function : LOS_MemLastUsedGet
- Description : get the size of last node(except end node which size is zero)
- Input       : pPool    --- Pointer to memory pool
- Output      : None
- Return      : the size of the last node
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemLastUsedGet(VOID *pPool)
+LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemUsedBlksGet(VOID *pool)
 {
-    LOS_MEM_POOL_INFO *pstPoolInfo = (LOS_MEM_POOL_INFO *)pPool;
+    LosMemDynNode *tmpNode = NULL;
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)pool;
+    UINT32 blkNums = 0;
+    UINT32 intSave;
 
-    if (pPool == NULL)
-    {
+    if (pool == NULL) {
         return LOS_NOK;
     }
 
-    return ((UINT32)(OS_MEM_END_NODE(pPool, pstPoolInfo->uwPoolSize)->pstPreNode) + sizeof(LOS_MEM_DYN_NODE));
-}
+    MEM_LOCK(intSave);
 
-/*****************************************************************************
- Function : LOS_MemUsedBlksGet
- Description : get the number of used node
- Input       : pPool    --- Pointer to memory pool
- Output      : None
- Return      : the number of used node
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemUsedBlksGet(VOID *pPool)
-{
-    LOS_MEM_DYN_NODE *pstTmpNode = (LOS_MEM_DYN_NODE *)NULL;
-    LOS_MEM_POOL_INFO *pstPoolInfo = (LOS_MEM_POOL_INFO *)pPool;
-    UINT32 uwBlkNums = 0;
-    UINTPTR uvIntSave;
-
-    if (pPool == NULL)
-    {
-        return LOS_NOK;
-    }
-
-    uvIntSave = LOS_IntLock();
-
-    for (pstTmpNode = OS_MEM_FIRST_NODE(pPool); pstTmpNode <= OS_MEM_END_NODE(pPool, pstPoolInfo->uwPoolSize);
-        pstTmpNode= OS_MEM_NEXT_NODE(pstTmpNode))
-    {
-        if (OS_MEM_NODE_GET_USED_FLAG(pstTmpNode->uwSizeAndFlag))
-        {
-            uwBlkNums++;
+    for (tmpNode = OS_MEM_FIRST_NODE(pool); tmpNode <= OS_MEM_END_NODE(pool, poolInfo->poolSize);
+         tmpNode = OS_MEM_NEXT_NODE(tmpNode)) {
+        if (OS_MEM_NODE_GET_USED_FLAG(tmpNode->selfNode.sizeAndFlag)) {
+            blkNums++;
         }
     }
 
-    LOS_IntRestore(uvIntSave);
+    MEM_UNLOCK(intSave);
 
-    return uwBlkNums;
+    return blkNums;
 }
 
-/*****************************************************************************
- Function :LOS_MemTaskIdGet
- Description : get a memory node's taskID if pointer node is "used node"
- Input       : pPtr   --- pointer to aim node
- Output      : None
- Return      : taskID --Ok or OS_INVALID --pointer node is illegal or free node
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemTaskIdGet(VOID *pPtr)
+LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemTaskIdGet(const VOID *ptr)
 {
-    LOS_MEM_DYN_NODE *pstTmpNode = (LOS_MEM_DYN_NODE *)NULL;
-    LOS_MEM_POOL_INFO *pstPoolInfo = (LOS_MEM_POOL_INFO *)OS_SYS_MEM_ADDR;
-    UINTPTR uvIntSave;
+    LosMemDynNode *tmpNode = NULL;
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)(VOID *)m_aucSysMem1;
+    UINT32 intSave;
+#ifdef LOSCFG_EXC_INTERACTION
+    if (ptr < (VOID *)m_aucSysMem1) {
+        poolInfo = (LosMemPoolInfo *)(VOID *)m_aucSysMem0;
+    }
+#endif
 
-    if (pPtr == NULL ||
-        pPtr < (VOID *)OS_MEM_FIRST_NODE(OS_SYS_MEM_ADDR) ||
-        pPtr > (VOID *)OS_MEM_END_NODE(OS_SYS_MEM_ADDR, pstPoolInfo->uwPoolSize))
-    {
-        PRINT_ERR("input ptr 0x%x is out of system memory range[0x%x, 0x%x]\n", (UINT32)pPtr, OS_MEM_FIRST_NODE(OS_SYS_MEM_ADDR),
-            OS_MEM_END_NODE(OS_SYS_MEM_ADDR, pstPoolInfo->uwPoolSize));/*lint !e515 !e516*/
+    if ((ptr == NULL) ||
+        (ptr < (VOID *)OS_MEM_FIRST_NODE(poolInfo)) ||
+        (ptr > (VOID *)OS_MEM_END_NODE(poolInfo, poolInfo->poolSize))) {
+        PRINT_ERR("input ptr %p is out of system memory range[%p, %p]\n", ptr, OS_MEM_FIRST_NODE(poolInfo),
+                  OS_MEM_END_NODE(poolInfo, poolInfo->poolSize));
         return OS_INVALID;
     }
 
-    uvIntSave= LOS_IntLock();
+    MEM_LOCK(intSave);
 
-    for (pstTmpNode = OS_MEM_FIRST_NODE(OS_SYS_MEM_ADDR); pstTmpNode <= OS_MEM_END_NODE(OS_SYS_MEM_ADDR, pstPoolInfo->uwPoolSize);
-        pstTmpNode = OS_MEM_NEXT_NODE(pstTmpNode))
-    {
-
-        if ((UINT32)pPtr < (UINT32)pstTmpNode)
-        {
-            if (OS_MEM_NODE_GET_USED_FLAG(pstTmpNode->pstPreNode->uwSizeAndFlag))
-            {
-                LOS_IntRestore(uvIntSave);
-                return (UINT32)(pstTmpNode->pstPreNode->stFreeNodeInfo.pstNext);
-            }
-            else
-            {
-                LOS_IntRestore(uvIntSave);
-                PRINT_ERR("input ptr 0x%x is belong to a free mem node\n", pPtr); /*lint !e626 !e515*/
+    for (tmpNode = OS_MEM_FIRST_NODE(poolInfo); tmpNode <= OS_MEM_END_NODE(poolInfo, poolInfo->poolSize);
+         tmpNode = OS_MEM_NEXT_NODE(tmpNode)) {
+        if ((UINTPTR)ptr < (UINTPTR)tmpNode) {
+            if (OS_MEM_NODE_GET_USED_FLAG(tmpNode->selfNode.preNode->selfNode.sizeAndFlag)) {
+                MEM_UNLOCK(intSave);
+                return tmpNode->selfNode.preNode->selfNode.taskId;
+            } else {
+                MEM_UNLOCK(intSave);
+                PRINT_ERR("input ptr %p is belong to a free mem node\n", ptr);
                 return OS_INVALID;
             }
         }
     }
 
-    LOS_IntRestore(uvIntSave);
+    MEM_UNLOCK(intSave);
     return OS_INVALID;
 }
 
-/*****************************************************************************
- Function : LOS_MemFreeBlksGet
- Description : get the number of free node
- Input       : pool    --- Pointer to memory pool
- Output      : None
- Return      : the number of free node
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemFreeBlksGet(VOID *pPool)
+LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemFreeBlksGet(VOID *pool)
 {
-    LOS_MEM_DYN_NODE *pstTmpNode = (LOS_MEM_DYN_NODE *)NULL;
-    LOS_MEM_POOL_INFO *pstPoolInfo = (LOS_MEM_POOL_INFO *)pPool;
-    UINT32 uwBlkNums = 0;
-    UINTPTR uvIntSave;
+    LosMemDynNode *tmpNode = NULL;
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)pool;
+    UINT32 blkNums = 0;
+    UINT32 intSave;
 
-    if (pPool == NULL)
-    {
+    if (pool == NULL) {
         return LOS_NOK;
     }
 
-    uvIntSave = LOS_IntLock();
+    MEM_LOCK(intSave);
 
-    for (pstTmpNode = OS_MEM_FIRST_NODE(pPool); pstTmpNode <= OS_MEM_END_NODE(pPool, pstPoolInfo->uwPoolSize);
-        pstTmpNode = OS_MEM_NEXT_NODE(pstTmpNode))
-    {
-        if (!OS_MEM_NODE_GET_USED_FLAG(pstTmpNode->uwSizeAndFlag))
-        {
-            uwBlkNums++;
+    for (tmpNode = OS_MEM_FIRST_NODE(pool); tmpNode <= OS_MEM_END_NODE(pool, poolInfo->poolSize);
+         tmpNode = OS_MEM_NEXT_NODE(tmpNode)) {
+        if (!OS_MEM_NODE_GET_USED_FLAG(tmpNode->selfNode.sizeAndFlag)) {
+            blkNums++;
         }
     }
 
-    LOS_IntRestore(uvIntSave);
+    MEM_UNLOCK(intSave);
 
-    return uwBlkNums;
+    return blkNums;
 }
 
-/*****************************************************************************
- Function : osMemResetEndNode
- Description : reset "end node"
- Input       : None
- Output      : endNode -- pointer to "end node"
- Return      : the number of free node
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR LOS_MEM_DYN_NODE *osMemResetEndNode(VOID)
+LITE_OS_SEC_TEXT_MINOR UINTPTR LOS_MemLastUsedGet(VOID *pool)
 {
-    LOS_MEM_DYN_NODE *pstEndNode = (LOS_MEM_DYN_NODE *)OS_MEM_END_NODE(OS_SYS_MEM_ADDR, OS_SYS_MEM_SIZE);
-    memset(pstEndNode, 0, sizeof(*pstEndNode));
-    pstEndNode->pstPreNode = (LOS_MEM_DYN_NODE *)NULL;
-    pstEndNode->uwSizeAndFlag = OS_MEM_NODE_HEAD_SIZE;
-    OS_MEM_NODE_SET_USED_FLAG(pstEndNode->uwSizeAndFlag);
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)pool;
+    LosMemDynNode *node = NULL;
 
-    return pstEndNode;
-}
-
-/*****************************************************************************
- Function : LOS_MemPoolSizeGet
- Description : get the memory pool's size
- Input       : pPool    --- Pointer to memory pool
- Output      : LOS_NOK & Other value -- The size of the memory pool.
- Return      : the size of the memory pool
-*****************************************************************************/
- LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemPoolSizeGet(VOID *pPool)
-{
-    if (pPool == NULL)
-    {
+    if (pool == NULL) {
         return LOS_NOK;
     }
-    return ((LOS_MEM_POOL_INFO *)pPool)->uwPoolSize;
+
+    node = OS_MEM_END_NODE(pool, poolInfo->poolSize)->selfNode.preNode;
+    if (OS_MEM_NODE_GET_USED_FLAG(node->selfNode.sizeAndFlag)) {
+        return (UINTPTR)((CHAR *)node + OS_MEM_NODE_GET_SIZE(node->selfNode.sizeAndFlag) + sizeof(LosMemDynNode));
+    } else {
+        return (UINTPTR)((CHAR *)node + sizeof(LosMemDynNode));
+    }
 }
 
-/*****************************************************************************
- Function : LOS_MemGetUsed
- Description : figure the system memory pool for it's total mem used
- Input       : None
- Output      : None
- Return      : the size of the system memory pool has been used
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemGetUsed(VOID)
+/*
+ * Description : reset "end node"
+ * Input       : pool    --- Pointer to memory pool
+ *               preAddr --- Pointer to the pre Pointer of end node
+ * Output      : endNode --- pointer to "end node"
+ * Return      : the number of free node
+ */
+LITE_OS_SEC_TEXT_MINOR VOID OsMemResetEndNode(VOID *pool, UINTPTR preAddr)
 {
-    return LOS_MemTotalUsedGet(OS_SYS_MEM_ADDR);
+    LosMemDynNode *endNode = (LosMemDynNode *)OS_MEM_END_NODE(pool, ((LosMemPoolInfo *)pool)->poolSize);
+    endNode->selfNode.sizeAndFlag = OS_MEM_NODE_HEAD_SIZE;
+    if (preAddr != 0) {
+        endNode->selfNode.preNode = (LosMemDynNode *)(preAddr - sizeof(LosMemDynNode));
+    }
+    OS_MEM_NODE_SET_USED_FLAG(endNode->selfNode.sizeAndFlag);
+    OsMemSetMagicNumAndTaskID(endNode);
+
+#ifdef LOSCFG_MEM_HEAD_BACKUP
+    OsMemNodeSave(endNode);
+#endif
 }
 
-/*****************************************************************************
- Function : LOS_MemGetTotal
- Description : get the system memory pool's size
- Input       : None
- Output      : None
- Return      : the size of the system memory pool
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemGetTotal(VOID)
+UINT32 LOS_MemPoolSizeGet(const VOID *pool)
 {
-    return ((LOS_MEM_POOL_INFO *)OS_SYS_MEM_ADDR)->uwPoolSize;
+    if (pool == NULL) {
+        return LOS_NOK;
+    }
+    return ((LosMemPoolInfo *)pool)->poolSize;
 }
 
-#ifdef OS_MEM_CHECK_DEBUG
-
-/*****************************************************************************
-  Function: LOS_MemNodeSizeCheck
-  Description: get a pNode's(pPtr) size ,include total size and available size
-  Input        :pPool --which pPool doesn't your pPtr belong to
-                   pPtr --point to source node
-  Output      :puwTotalSize -- save total size
-                   puwAvailSize -- save availabe size
-  Return : errorID or LOS_OK
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemNodeSizeCheck(VOID *pPool, VOID *pPtr, UINT32 *puwTotalSize, UINT32 *puwAvailSize)
+LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemInfoGet(VOID *pool, LOS_MEM_POOL_STATUS *poolStatus)
 {
-    VOID *pHead = NULL;
-    LOS_MEM_POOL_INFO *pstPoolInfo = (LOS_MEM_POOL_INFO *)pPool;
-    UINT8 *pucEndPool;
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)pool;
+    UINT32 ret;
+    UINT32 intSave;
 
-    if ( ucCheckMemLevel == LOS_MEM_CHECK_LEVEL_DISABLE)
-    {
-        return OS_ERRNO_MEMCHECK_DISABLED;
+    if (poolStatus == NULL) {
+        PRINT_ERR("can't use NULL addr to save info\n");
+        return LOS_NOK;
     }
 
-    if ( NULL == pPool)
-    {
-        return OS_ERRNO_MEMCHECK_NOT_INIT;
-    }
-    if (pPtr == NULL)
-    {
-        return OS_ERRNO_MEMCHECK_PARA_NULL;
+    if ((poolInfo == NULL) || ((UINTPTR)pool != (UINTPTR)poolInfo->pool)) {
+        PRINT_ERR("wrong mem pool addr: %p, line:%d\n", poolInfo, __LINE__);
+        return LOS_NOK;
     }
 
-    pucEndPool = (UINT8 *)pPool + pstPoolInfo->uwPoolSize;
-    if ( !( OS_MEM_MIDDLE_ADDR_OPEN_END(pPool, (UINT8 *)pPtr, pucEndPool)))
-    {
-        return OS_ERRNO_MEMCHECK_OUTSIDE;
+    MEM_LOCK(intSave);
+    ret = OsMemInfoGet(poolInfo, poolStatus);
+    MEM_UNLOCK(intSave);
+
+    return ret;
+}
+
+STATIC INLINE VOID OsShowFreeNode(UINT32 index, UINT32 length, const UINT32 *countNum)
+{
+    UINT32 count = 0;
+    PRINTK("\n    block size:  ");
+    while (count < length) {
+        PRINTK("2^%-5u", (index + OS_MIN_MULTI_DLNK_LOG2 + count));
+        count++;
+    }
+    PRINTK("\n    node number: ");
+    count = 0;
+    while (count < length) {
+        PRINTK("  %-5u", countNum[count + index]);
+        count++;
+    }
+}
+
+LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemFreeNodeShow(VOID *pool)
+{
+    LOS_DL_LIST *listNodeHead = NULL;
+    LosMultipleDlinkHead *headAddr = (LosMultipleDlinkHead *)((UINTPTR)pool + sizeof(LosMemPoolInfo));
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)pool;
+    UINT32 linkHeadIndex;
+    UINT32 countNum[OS_MULTI_DLNK_NUM] = { 0 };
+    UINT32 intSave;
+
+    if ((poolInfo == NULL) || ((UINTPTR)pool != (UINTPTR)poolInfo->pool)) {
+        PRINT_ERR("wrong mem pool addr: %p, line:%d\n", poolInfo, __LINE__);
+        return LOS_NOK;
     }
 
-    if ( ucCheckMemLevel == LOS_MEM_CHECK_LEVEL_HIGH)
-    {
-        pHead = osMemFindNodeCtrl(pPtr);
-        if ((pHead == NULL) || ((((LOS_MEM_DYN_NODE *)pHead)->uwSizeAndFlag & (~OS_MEM_NODE_USED_FLAG)) < ((UINT32)pPtr - (UINT32)pHead)))
-        {
-            return OS_ERRNO_MEMCHECK_NO_HEAD;
+    PRINTK("\n   ************************ left free node number**********************");
+    MEM_LOCK(intSave);
+
+    for (linkHeadIndex = 0; linkHeadIndex <= (OS_MULTI_DLNK_NUM - 1);
+         linkHeadIndex++) {
+        listNodeHead = headAddr->listHead[linkHeadIndex].pstNext;
+        while (listNodeHead != &(headAddr->listHead[linkHeadIndex])) {
+            listNodeHead = listNodeHead->pstNext;
+            countNum[linkHeadIndex]++;
         }
-        *puwTotalSize = (((LOS_MEM_DYN_NODE *)pHead)->uwSizeAndFlag - sizeof(LOS_MEM_DYN_NODE)) & (~OS_MEM_NODE_USED_FLAG);
-        *puwAvailSize = (((LOS_MEM_DYN_NODE *)pHead)->uwSizeAndFlag - ((UINT32)pPtr - (UINT32)pHead)) & (~OS_MEM_NODE_USED_FLAG);
+    }
+
+    linkHeadIndex = 0;
+    while (linkHeadIndex < OS_MULTI_DLNK_NUM) {
+        if (linkHeadIndex + COLUMN_NUM < OS_MULTI_DLNK_NUM) {
+            OsShowFreeNode(linkHeadIndex, COLUMN_NUM, countNum);
+            linkHeadIndex += COLUMN_NUM;
+        } else {
+            OsShowFreeNode(linkHeadIndex, (OS_MULTI_DLNK_NUM - 1 - linkHeadIndex), countNum);
+            break;
+        }
+    }
+
+    MEM_UNLOCK(intSave);
+    PRINTK("\n   ********************************************************************\n\n");
+
+    return LOS_OK;
+}
+
+#ifdef LOSCFG_BASE_MEM_NODE_SIZE_CHECK
+
+LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemNodeSizeCheck(VOID *pool, VOID *ptr, UINT32 *totalSize, UINT32 *availSize)
+{
+    const VOID *head = NULL;
+    LosMemPoolInfo *poolInfo = (LosMemPoolInfo *)pool;
+    UINT8 *endPool = NULL;
+
+    if (g_memCheckLevel == LOS_MEM_CHECK_LEVEL_DISABLE) {
+        return LOS_ERRNO_MEMCHECK_DISABLED;
+    }
+
+    if ((pool == NULL) || (ptr == NULL) || (totalSize == NULL) || (availSize == NULL)) {
+        return LOS_ERRNO_MEMCHECK_PARA_NULL;
+    }
+
+    endPool = (UINT8 *)pool + poolInfo->poolSize;
+    if (!(OS_MEM_MIDDLE_ADDR_OPEN_END(pool, ptr, endPool))) {
+        return LOS_ERRNO_MEMCHECK_OUTSIDE;
+    }
+
+    if (g_memCheckLevel == LOS_MEM_CHECK_LEVEL_HIGH) {
+        head = OsMemFindNodeCtrl(pool, ptr);
+        if ((head == NULL) ||
+            (OS_MEM_NODE_GET_SIZE(((LosMemDynNode *)head)->selfNode.sizeAndFlag) < ((UINTPTR)ptr - (UINTPTR)head))) {
+            return LOS_ERRNO_MEMCHECK_NO_HEAD;
+        }
+        *totalSize = OS_MEM_NODE_GET_SIZE(((LosMemDynNode *)head)->selfNode.sizeAndFlag - sizeof(LosMemDynNode));
+        *availSize = OS_MEM_NODE_GET_SIZE(((LosMemDynNode *)head)->selfNode.sizeAndFlag - ((UINTPTR)ptr -
+                                          (UINTPTR)head));
         return LOS_OK;
     }
-    if ( ucCheckMemLevel == LOS_MEM_CHECK_LEVEL_LOW)
-    {
-        if (pPtr != (VOID *)OS_MEM_ALIGN(pPtr, OS_MEM_ALIGN_SIZE))
-        {
-            return OS_ERRNO_MEMCHECK_NO_HEAD;
+    if (g_memCheckLevel == LOS_MEM_CHECK_LEVEL_LOW) {
+        if (ptr != (VOID *)OS_MEM_ALIGN(ptr, OS_MEM_ALIGN_SIZE)) {
+            return LOS_ERRNO_MEMCHECK_NO_HEAD;
         }
-        pHead = (VOID *)((UINT32)pPtr - sizeof(LOS_MEM_DYN_NODE));
-        if (OS_MEM_MAGIC_VALID(((LOS_MEM_DYN_NODE *)pHead)->stFreeNodeInfo.pstPrev))
-        {
-            *puwTotalSize = (((LOS_MEM_DYN_NODE *)pHead)->uwSizeAndFlag - sizeof(LOS_MEM_DYN_NODE)) & (~OS_MEM_NODE_USED_FLAG);
-            *puwAvailSize = (((LOS_MEM_DYN_NODE *)pHead)->uwSizeAndFlag - sizeof(LOS_MEM_DYN_NODE)) & (~OS_MEM_NODE_USED_FLAG);
+        head = (const VOID *)((UINTPTR)ptr - sizeof(LosMemDynNode));
+        if (OS_MEM_MAGIC_VALID(((LosMemDynNode *)head)->selfNode.freeNodeInfo.pstPrev)) {
+            *totalSize = OS_MEM_NODE_GET_SIZE(((LosMemDynNode *)head)->selfNode.sizeAndFlag - sizeof(LosMemDynNode));
+            *availSize = OS_MEM_NODE_GET_SIZE(((LosMemDynNode *)head)->selfNode.sizeAndFlag - sizeof(LosMemDynNode));
             return LOS_OK;
-        }
-        else
-        {
-            return OS_ERRNO_MEMCHECK_NO_HEAD;
+        } else {
+            return LOS_ERRNO_MEMCHECK_NO_HEAD;
         }
     }
 
-    return OS_ERRNO_MEMCHECK_WRONG_LEVEL;
+    return LOS_ERRNO_MEMCHECK_WRONG_LEVEL;
 }
 
-/*****************************************************************************
-Function     : osMemFindNodeCtrl
-Description : get a pool's memCtrl
-Input         :pPtr -- point to source pPtr
-Output       :None
-Return        : search forward for pPtr's memCtrl or "NULL"
-@attention : this func couldn't ensure the return memCtrl belongs to pPtr
-it just find forward the most nearly one
-*******************************************************************************/
-LITE_OS_SEC_TEXT_MINOR VOID *osMemFindNodeCtrl(VOID *pPtr)
+/*
+ * Description : get a pool's memCtrl
+ * Input       : ptr -- point to source ptr
+ * Return      : search forward for ptr's memCtrl or "NULL"
+ * attention : this func couldn't ensure the return memCtrl belongs to ptr it just find forward the most nearly one
+ */
+LITE_OS_SEC_TEXT_MINOR const VOID *OsMemFindNodeCtrl(const VOID *pool, const VOID *ptr)
 {
-    UINT8 *pucHead = (UINT8 *)pPtr;
+    const VOID *head = ptr;
 
-    if( pPtr == NULL )
-    {
+    if (ptr == NULL) {
         return NULL;
     }
 
-    pucHead = (UINT8 *)OS_MEM_ALIGN((VOID *)pucHead, OS_MEM_ALIGN_SIZE);
-    while (!OS_MEM_MAGIC_VALID(((LOS_MEM_DYN_NODE *)pucHead)->stFreeNodeInfo.pstPrev))
-    {
-        pucHead -= 4;
+    head = (const VOID *)OS_MEM_ALIGN(head, OS_MEM_ALIGN_SIZE);
+    while (!OS_MEM_MAGIC_VALID(((LosMemDynNode *)head)->selfNode.freeNodeInfo.pstPrev)) {
+        head = (const VOID *)((UINT8 *)head - sizeof(CHAR *));
+        if (head <= pool) {
+            return NULL;
+        }
     }
-    return pucHead;
+    return head;
 }
 
-/*****************************************************************************
- Function : LOS_MemCheckLevelSet
- Description : setting ucCheckMemLevel which decide the manner of memcheck
- Input       : ucLevel -- waht level want to set
- Output      : None
- Return      : LOS_OK -- setting succeed
-                  OS_ERRNO_MEMCHECK_WRONG_LEVEL -- setting failed due to illegal parameter
-*****************************************************************************/
-LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemCheckLevelSet(UINT8 ucLevel)
+LITE_OS_SEC_TEXT_MINOR UINT32 LOS_MemCheckLevelSet(UINT8 checkLevel)
 {
-    if ( ucLevel == LOS_MEM_CHECK_LEVEL_LOW)
-    {
+    if (checkLevel == LOS_MEM_CHECK_LEVEL_LOW) {
         PRINTK("%s: LOS_MEM_CHECK_LEVEL_LOW \n", __FUNCTION__);
-    }
-    else if(ucLevel == LOS_MEM_CHECK_LEVEL_HIGH)
-    {
+    } else if (checkLevel == LOS_MEM_CHECK_LEVEL_HIGH) {
         PRINTK("%s: LOS_MEM_CHECK_LEVEL_HIGH \n", __FUNCTION__);
-    }
-    else if (ucLevel == LOS_MEM_CHECK_LEVEL_DISABLE)
-    {
+    } else if (checkLevel == LOS_MEM_CHECK_LEVEL_DISABLE) {
         PRINTK("%s: LOS_MEM_CHECK_LEVEL_DISABLE \n", __FUNCTION__);
+    } else {
+        PRINTK("%s: wrong param, setting failed !! \n", __FUNCTION__);
+        return LOS_ERRNO_MEMCHECK_WRONG_LEVEL;
     }
-    else
-    {
-        PRINTK("%s: wrong para, setting failed !! \n", __FUNCTION__);
-        return OS_ERRNO_MEMCHECK_WRONG_LEVEL;
-    }
-    ucCheckMemLevel = ucLevel;
+    g_memCheckLevel = checkLevel;
     return LOS_OK;
 }
 
 LITE_OS_SEC_TEXT_MINOR UINT8 LOS_MemCheckLevelGet(VOID)
 {
-    return ucCheckMemLevel;
+    return g_memCheckLevel;
 }
 
-#endif /* OS_MEM_CHECK_DEBUG */
 
-LITE_OS_SEC_TEXT_MINOR UINT32 osMemSysNodeCheck(VOID *pDst, VOID *pSrc, UINT32 uwLength, UINT8 ucPos)
+UINT32 OsMemSysNodeCheck(VOID *dstAddr, VOID *srcAddr, UINT32 nodeLength, UINT8 pos)
 {
-#ifdef OS_MEM_CHECK_DEBUG
-    UINT32 uwRet = 0;
-    UINT32 uwTotalSize=0;
-    UINT32 uwAvailSize=0;
-
-    if (ucPos == 0) /* if this func was called by memset */
-    {
-        uwRet = LOS_MemNodeSizeCheck(m_aucSysMem0, pDst, &uwTotalSize, &uwAvailSize);
-        if (uwRet == LOS_OK && uwLength > uwAvailSize)
-        {
-            PRINT_ERR("---------------------------------------------\n");/*lint !e515*/
-            PRINT_ERR("memset: dst inode uwAvailSize is not enough"
-                                " uwAvailSize = 0x%x uwLength = 0x%x\n", uwAvailSize, uwLength);/*lint !e515 !e516*/
-            osBackTrace();
-            PRINT_ERR("---------------------------------------------\n");/*lint !e515*/
-            return LOS_NOK;
-        }
-    }
-    else if (ucPos == 1) /* if this func was called by memcpy */
-    {
-        uwRet = LOS_MemNodeSizeCheck(m_aucSysMem0, pDst, &uwTotalSize, &uwAvailSize);
-        if (uwRet == LOS_OK && uwLength > uwAvailSize)
-        {
-            PRINT_ERR("---------------------------------------------\n");/*lint !e515*/
-            PRINT_ERR("memcpy: dst inode uwAvailSize is not enough"
-                               " uwAvailSize = 0x%x uwLength = 0x%x\n", uwAvailSize, uwLength);/*lint !e515 !e516*/
-            osBackTrace();
-            PRINT_ERR("---------------------------------------------\n");/*lint !e515*/
-            return LOS_NOK;
-        }
-        uwRet = LOS_MemNodeSizeCheck(m_aucSysMem0, pSrc, &uwTotalSize, &uwAvailSize);
-        if (uwRet == LOS_OK && uwLength > uwAvailSize)
-        {
-            PRINT_ERR("---------------------------------------------\n");/*lint !e515*/
-            PRINT_ERR("memcpy: src inode uwAvailSize is not enough"
-                               " uwAvailSize = 0x%x uwLength = 0x%x\n", uwAvailSize, uwLength);/*lint !e515 !e516*/
-            osBackTrace();
-            PRINT_ERR("---------------------------------------------\n");/*lint !e515*/
-            return LOS_NOK;
-        }
+    UINT32 ret;
+    UINT32 totalSize = 0;
+    UINT32 availSize = 0;
+    UINT8 *pool = m_aucSysMem1;
+#ifdef LOSCFG_EXC_INTERACTION
+    if ((UINTPTR)dstAddr < ((UINTPTR)m_aucSysMem0 + g_excInteractMemSize)) {
+        pool = m_aucSysMem0;
     }
 #endif
+    if (pos == 0) { /* if this func was called by memset */
+        ret = LOS_MemNodeSizeCheck(pool, dstAddr, &totalSize, &availSize);
+        if ((ret == LOS_OK) && (nodeLength > availSize)) {
+            PRINT_ERR("---------------------------------------------\n");
+            PRINT_ERR("memset: dst inode availSize is not enough"
+                      " availSize = 0x%x, memset length = 0x%x\n", availSize, nodeLength);
+            OsBackTrace();
+            PRINT_ERR("---------------------------------------------\n");
+            return LOS_NOK;
+        }
+    } else if (pos == 1) { /* if this func was called by memcpy */
+        ret = LOS_MemNodeSizeCheck(pool, dstAddr, &totalSize, &availSize);
+        if ((ret == LOS_OK) && (nodeLength > availSize)) {
+            PRINT_ERR("---------------------------------------------\n");
+            PRINT_ERR("memcpy: dst inode availSize is not enough"
+                      " availSize = 0x%x, memcpy length = 0x%x\n", availSize, nodeLength);
+            OsBackTrace();
+            PRINT_ERR("---------------------------------------------\n");
+            return LOS_NOK;
+        }
+#ifdef LOSCFG_EXC_INTERACTION
+        if ((UINTPTR)srcAddr < ((UINTPTR)m_aucSysMem0 + g_excInteractMemSize)) {
+            pool = m_aucSysMem0;
+        } else {
+            pool = m_aucSysMem1;
+        }
+#endif
+        ret = LOS_MemNodeSizeCheck(pool, srcAddr, &totalSize, &availSize);
+        if ((ret == LOS_OK) && (nodeLength > availSize)) {
+            PRINT_ERR("---------------------------------------------\n");
+            PRINT_ERR("memcpy: src inode availSize is not enough"
+                      " availSize = 0x%x, memcpy length = 0x%x\n",
+                      availSize, nodeLength);
+            OsBackTrace();
+            PRINT_ERR("---------------------------------------------\n");
+            return LOS_NOK;
+        }
+    }
+    return LOS_OK;
+}
+#endif /* LOSCFG_BASE_MEM_NODE_SIZE_CHECK */
+
+#ifdef LOSCFG_MEM_MUL_MODULE
+STATIC INLINE UINT32 OsMemModCheck(UINT32 moduleId)
+{
+    if (moduleId > MEM_MODULE_MAX) {
+        PRINT_ERR("error module ID input!\n");
+        return LOS_NOK;
+    }
     return LOS_OK;
 }
 
+STATIC INLINE VOID *OsMemPtrToNode(VOID *ptr)
+{
+    UINT32 gapSize;
+
+    if ((UINTPTR)ptr & (OS_MEM_ALIGN_SIZE - 1)) {
+        PRINT_ERR("[%s:%d]ptr:%p not align by 4byte\n", __FUNCTION__, __LINE__, ptr);
+        return NULL;
+    }
+
+    gapSize = *((UINT32 *)((UINTPTR)ptr - sizeof(UINT32)));
+    if (OS_MEM_NODE_GET_ALIGNED_FLAG(gapSize) && OS_MEM_NODE_GET_USED_FLAG(gapSize)) {
+        PRINT_ERR("[%s:%d]gapSize:0x%x error\n", __FUNCTION__, __LINE__, gapSize);
+        return NULL;
+    }
+    if (OS_MEM_NODE_GET_ALIGNED_FLAG(gapSize)) {
+        gapSize = OS_MEM_NODE_GET_ALIGNED_GAPSIZE(gapSize);
+        if ((gapSize & (OS_MEM_ALIGN_SIZE - 1)) || (gapSize > ((UINTPTR)ptr - OS_MEM_NODE_HEAD_SIZE))) {
+            PRINT_ERR("[%s:%d]gapSize:0x%x error\n", __FUNCTION__, __LINE__, gapSize);
+            return NULL;
+        }
+
+        ptr = (VOID *)((UINTPTR)ptr - gapSize);
+    }
+
+    return (VOID *)((UINTPTR)ptr - OS_MEM_NODE_HEAD_SIZE);
+}
+
+STATIC INLINE UINT32 OsMemNodeSizeGet(VOID *ptr)
+{
+    LosMemDynNode *node = (LosMemDynNode *)OsMemPtrToNode(ptr);
+    if (node == NULL) {
+        return 0;
+    }
+
+    return OS_MEM_NODE_GET_SIZE(node->selfNode.sizeAndFlag);
+}
+
+VOID *LOS_MemMalloc(VOID *pool, UINT32 size, UINT32 moduleId)
+{
+    UINT32 intSave;
+    VOID *ptr = NULL;
+    VOID *node = NULL;
+    if (OsMemModCheck(moduleId) == LOS_NOK) {
+        return NULL;
+    }
+    ptr = LOS_MemAlloc(pool, size);
+    if (ptr != NULL) {
+        MEM_LOCK(intSave);
+        g_moduleMemUsedSize[moduleId] += OsMemNodeSizeGet(ptr);
+        node = OsMemPtrToNode(ptr);
+        if (node != NULL) {
+            OS_MEM_MODID_SET(node, moduleId);
+        }
+        MEM_UNLOCK(intSave);
+    }
+    return ptr;
+}
+
+VOID *LOS_MemMallocAlign(VOID *pool, UINT32 size, UINT32 boundary, UINT32 moduleId)
+{
+    UINT32 intSave;
+    VOID *ptr = NULL;
+    VOID *node = NULL;
+    if (OsMemModCheck(moduleId) == LOS_NOK) {
+        return NULL;
+    }
+    ptr = LOS_MemAllocAlign(pool, size, boundary);
+    if (ptr != NULL) {
+        MEM_LOCK(intSave);
+        g_moduleMemUsedSize[moduleId] += OsMemNodeSizeGet(ptr);
+        node = OsMemPtrToNode(ptr);
+        if (node != NULL) {
+            OS_MEM_MODID_SET(node, moduleId);
+        }
+        MEM_UNLOCK(intSave);
+    }
+    return ptr;
+}
+
+UINT32 LOS_MemMfree(VOID *pool, VOID *ptr, UINT32 moduleId)
+{
+    UINT32 intSave;
+    UINT32 ret;
+    UINT32 size;
+    LosMemDynNode *node = NULL;
+
+    if ((OsMemModCheck(moduleId) == LOS_NOK) || (ptr == NULL) || (pool == NULL)) {
+        return LOS_NOK;
+    }
+
+    node = (LosMemDynNode *)OsMemPtrToNode(ptr);
+    if (node == NULL) {
+        return LOS_NOK;
+    }
+
+    size = OS_MEM_NODE_GET_SIZE(node->selfNode.sizeAndFlag);
+
+    if (moduleId != OS_MEM_MODID_GET(node)) {
+        PRINT_ERR("node[%p] alloced in module %lu, but free in module %u\n node's taskId: 0x%x\n",
+                  ptr, OS_MEM_MODID_GET(node), moduleId, OS_MEM_TASKID_GET(node));
+        moduleId = OS_MEM_MODID_GET(node);
+    }
+
+    ret = LOS_MemFree(pool, ptr);
+    if (ret == LOS_OK) {
+        MEM_LOCK(intSave);
+        g_moduleMemUsedSize[moduleId] -= size;
+        MEM_UNLOCK(intSave);
+    }
+    return ret;
+}
+
+VOID *LOS_MemMrealloc(VOID *pool, VOID *ptr, UINT32 size, UINT32 moduleId)
+{
+    VOID *newPtr = NULL;
+    UINT32 oldNodeSize;
+    UINT32 intSave;
+    LosMemDynNode *node = NULL;
+    UINT32 oldModuleId = moduleId;
+
+    if ((OsMemModCheck(moduleId) == LOS_NOK) || (pool == NULL)) {
+        return NULL;
+    }
+
+    if (ptr == NULL) {
+        return LOS_MemMalloc(pool, size, moduleId);
+    }
+
+    node = (LosMemDynNode *)OsMemPtrToNode(ptr);
+    if (node == NULL) {
+        return NULL;
+    }
+
+    if (moduleId != OS_MEM_MODID_GET(node)) {
+        PRINT_ERR("a node[%p] alloced in module %lu, but realloc in module %u\n node's taskId: %lu\n",
+                  ptr, OS_MEM_MODID_GET(node), moduleId, OS_MEM_TASKID_GET(node));
+        oldModuleId = OS_MEM_MODID_GET(node);
+    }
+
+    if (size == 0) {
+        (VOID)LOS_MemMfree(pool, ptr, oldModuleId);
+        return NULL;
+    }
+
+    oldNodeSize = OsMemNodeSizeGet(ptr);
+    newPtr = LOS_MemRealloc(pool, ptr, size);
+    if (newPtr != NULL) {
+        MEM_LOCK(intSave);
+        g_moduleMemUsedSize[moduleId] += OsMemNodeSizeGet(newPtr);
+        g_moduleMemUsedSize[oldModuleId] -= oldNodeSize;
+        node = (LosMemDynNode *)OsMemPtrToNode(newPtr);
+        OS_MEM_MODID_SET(node, moduleId);
+        MEM_UNLOCK(intSave);
+    }
+    return newPtr;
+}
+
+UINT32 LOS_MemMusedGet(UINT32 moduleId)
+{
+    if (OsMemModCheck(moduleId) == LOS_NOK) {
+        return OS_NULL_INT;
+    }
+    return g_moduleMemUsedSize[moduleId];
+}
+#endif
 
 #ifdef __cplusplus
 #if __cplusplus

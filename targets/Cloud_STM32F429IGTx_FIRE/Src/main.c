@@ -1,6 +1,8 @@
 /*----------------------------------------------------------------------------
- * Copyright (c) <2016-2018>, <Huawei Technologies Co., Ltd>
- * All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2013-2020. All rights reserved.
+ * Description: Main Process
+ * Author: Huawei LiteOS Team
+ * Create: 2013-01-01
  * Redistribution and use in source and binary forms, with or without modification,
  * are permitted provided that the following conditions are met:
  * 1. Redistributions of source code must retain the above copyright notice, this list of
@@ -22,52 +24,48 @@
  * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *---------------------------------------------------------------------------*/
-/*----------------------------------------------------------------------------
- * Notice of Export Control Law
- * ===============================================
- * Huawei LiteOS may be subject to applicable export control laws and regulations, which might
- * include those applicable to Huawei LiteOS of U.S. and the country in which you are located.
- * Import, export and usage of Huawei LiteOS in any manner by you shall be in compliance with such
- * applicable export control laws and regulations.
- *---------------------------------------------------------------------------*/
+ * --------------------------------------------------------------------------- */
+
 #include "main.h"
 #include "sys_init.h"
-
-
 #include "los_base.h"
-#include "los_task.ph"
+#include "los_task_pri.h"
 #include "los_typedef.h"
 #include "los_sys.h"
+#include "hal_rng.h"
+#include "timer.h"
 
+VOID board_config(VOID)
+{
+    g_sys_mem_addr_end = __LOS_HEAP_ADDR_END__;
+}
 
-VOID HardWare_Init(VOID)
+VOID HardwareInit(VOID)
 {
     SystemClock_Config();
-    Debug_USART1_UART_Init();
+    MX_USART1_UART_Init();
+    TimerInit();
     hal_rng_config();
     dwt_delay_init(SystemCoreClock);
 }
 
-int main(void)
+INT32 main(VOID)
 {
-    UINT32 uwRet = LOS_OK;
-    HardWare_Init();
+    board_config();
+    HardwareInit();
 
-    uwRet = LOS_KernelInit();
-    if (uwRet != LOS_OK)
-    {
+    PRINT_RELEASE("\n********Hello Huawei LiteOS********\n"
+                  "\nLiteOS Kernel Version : %s\n"
+                  "build data : %s %s\n\n"
+                  "**********************************\n",
+                  HW_LITEOS_KERNEL_VERSION_STRING, __DATE__, __TIME__);
+
+    UINT32 ret = OsMain();
+    if (ret != LOS_OK) {
         return LOS_NOK;
     }
 
-    extern UINT32 create_work_tasks(VOID);
-    uwRet = create_work_tasks();
-    if (uwRet != LOS_OK)
-    {
-        return LOS_NOK;
-    }
+    OsStart();
 
-
-    (void)LOS_Start();
     return 0;
 }

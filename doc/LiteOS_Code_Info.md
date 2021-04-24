@@ -3,300 +3,108 @@
 ## LiteOS代码入口
 
 LiteOS入口在工程对应的main.c中，基本流程如下：
-
-int main(void)
-
+```c
+INT32 main(VOID)
 {
+    HardwareInit();
 
-    UINT32 uwRet = LOS_OK;
+    PRINT_RELEASE("\n********Hello Huawei LiteOS********\n"
+                  "\nLiteOS Kernel Version : %s\n"
+                  "build data : %s %s\n\n"
+                  "**********************************\n",
+                  HW_LITEOS_KERNEL_VERSION_STRING, __DATE__, __TIME__);
 
-    HardWare_Init();
-
-    uwRet = LOS_KernelInit();
-    
-    if (uwRet != LOS_OK)
-    {
+    UINT32 ret = OsMain();
+    if (ret != LOS_OK) {
         return LOS_NOK;
     }
 
-    LOS_Inspect_Entry();
+    OsStart();
 
-    LOS_Start();
+    return 0;
 }
+```
 
-1. 首先进行硬件初始化  HardWare_Init();
-   
-2. 初始化LiteOS内核 LOS_KernelInit();
+首先进行硬件初始化HardwareInit()，然后打印Huawei LiteOS的版本信息；
 
-3. 初始化内核例程 LOS_Inspect_Entry();
-   
-4. 最后调用LOS_Start();开始task调度，LiteOS开始正常工作;
+接着执行OsMain()初始化Huawei LiteOS内核及例程，在OsMain()函数中会创建用户任务，其任务处理函数为app_init()；
+
+最后调用OsStart()开始任务调度，Huawei LiteOS开始正常工作。
 
 
 ## LiteOS的代码目录结构说明
 
 关于代码树中各个目录存放的源代码的相关内容简介如下：
 
-<table>
-<tr>
-	<td width="12%">一级目录</td>
-	<td width="21%">二级目录</td>
-	<td width="12%">三级目录</td>
-	<td >说明</td>
-</tr>
-<tr>
-	<td>arch</td>
-	<td>arm</td>
-	<td>arm-m</td>
-	<td>M核中断、调度、tick相关代码</td>
-</tr>
-<tr>
-	<td></td>
-	<td></td>
-	<td>common</td>
-	<td>arm核公用的cmsis core接口</td>
-</tr>
-<tr>
-	<td>components</td>
-	<td>cmsis</td>
-	<td></td>
-	<td>LiteOS提供的cmsis os接口实现</td>
-</tr>
-<tr>
-	<td></td>
-	<td>connectivity</td>
-	<td>agent_tiny</td>
-	<td>agent_tiny端云互通组件，包括公共头文件、示例代码、客户端实现代码、操作系统适配层代码</td>
-</tr>
-<tr>
-	<td></td>
-	<td></td>
-	<td>at_frame</td>
-	<td>LiteOS AT框架实现</td>
-</tr>
-<tr>
-	<td></td>
-	<td></td>
-	<td>lwm2m</td>
-	<td>lwm2m协议实现</td>
-</tr>
-<tr>
-	<td></td>
-	<td></td>
-	<td>nbiot</td>
-	<td>LiteOS NB-IoT API</td>
-</tr>
-<tr>
-	<td></td>
-	<td></td>
-	<td>paho.mqtt.embedded-c-1.1.0</td>
-	<td>MQTT开源协议实现</td>
-</tr>
-<tr>
-	<td></td>
-	<td>fota</td>
-	<td></td>
-	<td>固件升级代码</td>
-</tr>
-</tr>
-	<tr>
-	<td></td>
-	<td>fs</td>
-	<td></td>
-	<td>文件系统，含VFS、spiffs、ramfs、kifs、devfs</td>
-</tr>
-</tr>
-	<tr>
-	<td></td>
-	<td>lib</td>
-	<td>libc</td>
-	<td>LiteOS libc优化</td>
-</tr>
-<tr>
-	<td></td>
-	<td>net</td>
-	<td>lwip_port</td>
-	<td>lwip驱动及OS适配代码</td>
-</tr>
-<tr>
-	<td></td>
-	<td></td>
-	<td>lwip-2.0.3</td>
-	<td>lwip协议实现</td>
-</tr>
-<tr>
-	<td></td>
-	<td>security</td>
-	<td>mbedtls/mbedtls_port</td>
-	<td>MBEDTLS的OS适配代码</td>
-</tr>
-<tr>
-	<td></td>
-	<td></td>
-	<td>mbedtls/mbedtl-2.6.0</td>
-	<td>MBEDTLS协议实现</td>
-</tr>
-<tr>
-	<td>doc</td>
-	<td></td>
-	<td></td>
-	<td>此目录存放的是LiteOS的使用文档和API说明等文档</td>
-</tr>
-<tr>
-	<td>examples</td>
-	<td>API</td>
-	<td></td>
-	<td>供开发者测试LiteOS内核的demo示例，此目录存放的是内核功能测试用的相关用例的代码</td>
-</tr>
-<tr>
-	<td></td>
-	<td>include</td>
-	<td></td>
-	<td>API功能头文件存放目录</td>
-</tr>
-<tr>
-	<td>kernel</td>
-	<td>base</td>
-	<td>core</td>
-	<td>LiteOS基础内核代码，包括队列、task调度、软timer、时间片计算等功能</td>
-</tr>
-<tr>
-	<td></td>
-	<td></td>
-	<td>OM</td>
-	<td>与错误处理相关的文件</td>
-</tr>
-<tr>
-	<td></td>
-	<td></td>
-	<td>include</td>
-	<td>LiteOS内核内部使用的头文件</td>
-</tr>
-<tr>
-	<td></td>
-	<td></td>
-	<td>ipc</td>
-	<td>LiteOS中task间通讯的相关接口，包括事件、信号量、消息队列、互斥锁等</td>
-</tr>
-<tr>
-	<td></td>
-	<td></td>
-	<td>mem</td>
-	<td>LiteOS中的内核内存管理的相关代码</td>
-</tr>
-<tr>
-	<td></td>
-	<td></td>
-	<td>misc</td>
-	<td>内存对齐功能以及毫秒级休眠sleep功能</td>
-</tr>
-
-<tr>
-	<td></td>
-	<td>include</td>
-	<td></td>
-	<td>LiteOS开源内核头文件</td>
-</tr>
-<tr>
-	<td></td>
-	<td>extended</td>
-	<td>tickless</td>
-	<td>低功耗框架代码</td>
-</tr>
-<tr>
-	<td>targets</td>
-	<td>Cloud_NB-IoT_STM32F103RE_OneNET</td>
-	<td></td>
-	<td>中国移动OneNet NB-IoT 端云demo工程</td>
-</tr>
-<tr>
-	<td></td>
-	<td>Cloud_NXP51U68</td>
-	<td></td>
-	<td>NXP ARM Cortex M0 ENC28J60以太网LiteOS SDK端云demo</td>
-</tr>
-<tr>
-	<td></td>
-	<td>Cloud_STM32F429IGTx_FIRE</td>
-	<td></td>
-	<td>野火STM32F429(ARM Cortex M4)以太网/ESP8266串口WiFi/SIM900A GPRS/NB-IoT BC95四种连接方式的LiteOS SDK端云demo，内部用编译宏区分，其中wifi、gprs、NB-IOT使用LiteOS SDK的AT框架实现</td>
-</tr>
-<tr>
-	<td></td>
-	<td>Cloud_STM32L431RxTx_IoTClub</td>
-	<td></td>
-	<td>物联网俱乐部EVB-M1 STM32L431（ARM Cortex M4）ESP8266WiFi/NB-IoT BC95两种连接方式的LiteOS SDK端云demo</td>
-</tr>
-<tr>
-	<td></td>
-	<td>Cloud_STM3210E_EVAL</td>
-	<td></td>
-	<td>STM3210E（ARM Cortex M3）W5500 以太网LiteOS SDK端云demo</td>
-</tr>
-<tr>
-	<td></td>
-	<td>Cloud_wifi_STM32F429ZI_NUCLEO</td>
-	<td></td>
-	<td>STM32F429（ARM Cortex M4）marvell SDIO wifi LiteOS SDK端云demo</td>
-</tr>
-<tr>
-	<td></td>
-	<td>Cloud_wifi_STM32F767ZI_NUCLEO</td>
-	<td></td>
-	<td>STM32F767（ARM Cortex M7）esp8266 spi wifi LiteOS SDK端云demo</td>
-</tr>
-<tr>
-	<td></td>
-	<td>Demo_Tutorial_STM32F103VC_TAIBI</td>
-	<td></td>
-	<td>STM32F103_TAIBI（ARM Cortex M3）LiteOS入门demo，最简单的LED点灯示例程序</td>
-</tr>
-<tr>
-	<td></td>
-	<td>Standard_FRDM_KW41Z</td>
-	<td></td>
-	<td>FRDM（ARM Cortex M0+）Standard前缀命名的工程仅为内核移植demo，下同（含原厂芯片驱动）</td>
-</tr>
-<tr>
-	<td></td>
-	<td>Standard_IMXRT1052_FIRE</td>
-	<td></td>
-	<td>IMXRT1052（ARM Cortex M7）跨界处理器NXP IMXRT1052内核移植demo（含原厂芯片驱动）</td>
-</tr>
-<tr>
-	<td></td>
-	<td>Standard_msp430f5438a_taurus_v4.2</td>
-	<td></td>
-	<td>MSP430（TI 16位低功耗单片机）LiteOS首个16位单片机内核移植demo（含原厂芯片驱动）</td>
-</tr>
-<tr>
-	<td></td>
-	<td>Standard_NRF51822_BLE</td>
-	<td></td>
-	<td>NRF51822（ARM Cortex M0）NRF51822蓝牙芯片内核移植demo（含原厂芯片驱动）</td>
-</tr>
-<tr>
-	<td></td>
-	<td>Standard_STM32F0Discovery</td>
-	<td></td>
-	<td>STM32F0Discovery（ARM Cortex M0）STM32F0 内核移植demo，RAM 8KB，资源裁剪可参考该工程配置（含原厂芯片驱动）</td>
-</tr>
-<tr>
-	<td></td>
-	<td>Standard_STM32F103RB_NUCLEO</td>
-	<td></td>
-	<td>F103（ARM Cortex M3）STM32F103内核移植demo（含原厂芯片驱动）</td>
-</tr>
-<tr>
-	<td></td>
-	<td>Standard_STM32F103VC_TAIBI</td>
-	<td></td>
-	<td>STM32F103VC_TAIBI（ARM Cortex M3）钛比STM32F103开发板内核移植demo（含原厂芯片驱动）</td>
-</tr>
-<tr>
-	<td></td>
-	<td>Standard_STM32F746ZG_NUCLEO</td>
-	<td></td>
-	<td>F746（ARM Cortex M7）STM32F746内核移植demo（含原厂芯片驱动）</td>
-</tr>
-</table>
+| 一级目录   | 二级目录                 | 三级目录             | 说明                                                          |
+| ---------- | ------------------------ | -------------------- | ------------------------------------------------------------  |
+| arch       | arm                      | cortex_a_r           | A核架构支持                                                   |
+|            |                          | cortex_m             | M核架构支持                                                   |
+|            | arm64                    |                      | arm64架构支持                                                 |
+| build      |                          |                      | LiteOS编译系统需要的配置及脚本                                |
+| compat     | cmsis                    |                      | liteos提供的CMSIS-RTOS 1.0和2.0接口                           |
+| components | connectivity             | agent_tiny           | agent_tiny端云互通组件，包括公共头文件、示例代码、客户端实现代码、操作系统适配层代码 |
+|            |                          | lwm2m                | lwm2m协议实现                                                |
+|            |                          | mqtt                 | MQTT开源协议实现                                             |
+|            |                          | nb_iot               | LiteOS NB-IoT API                                            |
+|            | fs                       |                      | 文件系统，含vfs、spiffs、ramfs、kifs、fatfs、devfs           |
+|            | gui                      | lvgl                 | 开源LittlevGL的源码                                          |
+|            | lib                      | cjson                | c语言json库                                                  |
+|            | log                      |                      | 日志等级控制                                                 |
+|            | net                      | at_device            | AT设备适配层                                                 |
+|            |                          | at_frame             | LiteOS AT框架API                                             |
+|            |                          | lwip/lwip_port       | lwip驱动及OS适配代码                                         |
+|            |                          | lwip/lwip-2.1.2      | lwip协议实现                                                 |
+|            |                          | lwip/ppp_port        | lwip协议ppp端口支持                                          |
+|            |                          | sal                  | socket通讯支持                                               |
+|            | ota                      |                      | 固件升级代码                                                 |
+|            | security                 | mbedtls/mbedtls_port | mbed TLS的OS适配代码                                         |
+|            |                          | mbedtls/mbedtl-2.16.8| mbed TLS协议实现                                             |
+|            | sensorhub                | include              | sensor manager头文件                                         |
+|            |                          | src                  | sensor manager的源码实现                                     |
+| demos      | agenttiny_lwm2m          |                      | lwm2m协议 demo                                               |
+|            | agenttiny_mqtt           |                      | mqtt 协议demo                                                |
+|            | dtls_server              |                      | dtls协议demo                                                 |
+|            | fs                       |                      | 文件系统demo                                                 |
+|            | gui                      |                      | gui的demo                                                    |
+|            | ipv6_client              |                      | Ipv6协议demo                                                 |
+|            | kernel                   | api                  | 供开发者测试LiteOS内核的demo示例代码                         |
+|            |                          | include              | API功能头文件存放目录                                        |
+|            | lms                      |                      | LMS的demo                                                    |
+|            | nbiot_without_atiny      |                      | NB_IoT demo                                                  |
+|            | sensorhub                | gyro                 | 基于sensorhub传感框架定时读取MPU6050陀螺仪原始数据的demo     |
+| doc        |                          |                      | 此目录存放的是LiteOS的使用文档和API说明等文档                |
+| include    |                          |                      | components各个模块所依赖的头文件                             |
+| kernel     | base                     |                      | LiteOS基础内核代码，包括任务、中断、软件定时器、队列、事件、信号量、互斥锁、tick等功能 |
+|            |                          | debug                | LiteOS内核调测代码，包括队列、信号量、互斥锁及任务调度的调测 |
+|            |                          | include              | LiteOS基础内核内部使用的头文件                               |
+|            |                          | mem                  | LiteOS中的内存管理相关代码                                   |
+|            |                          | sched                | 任务调度支持，包括对多核的调度支持                           |
+|            |                          | shellcmd             | LiteOS中与基础内核相关的shell命令，包括memcheck、task、systeminfo、swtmr等 |
+|            | extended                 | cppsupport           | C++兼容适配层底层接口                                        |
+|            |                          | cpup                 | CPU占用率统计接口                                            |
+|            |                          | include              | extended目录所需的头文件                                     |
+|            |                          | lms                  | LMS（实时检测内存操作合法性算法）的库文件                    |
+|            |                          | lowpower             | 低功耗框架相关代码                                           |
+|            |                          | trace                | trace事件跟踪，用于实时记录系统运行轨迹                      |
+|            | include                  |                      | LiteOS开源内核头文件                                         |
+|            | init                     |                      | LiteOS内核初始化相关代码                                     |
+| lib        | huawei_libc              |                      | LiteOS自研libc库和适配的posix接口                            |
+|            | libc                     |                      | LiteOS适配的musl libc库                                      |
+|            | libsec                   |                      | 华为安全函数库                                               |
+|            | zlib                     |                      | 开源zlib库                                                   |
+| osdepends  | liteos                   |                      | LiteOS提供的部分OS适配接口                                   |
+| shell      |                          |                      | 实现shell命令的代码，支持基本调试功能                        |
+| targets    | bsp                      |                      | 通用板级支持包                                               |
+|            | Cloud_STM32F429IGTx_FIRE |                      | 野火STM32F429（ARM Cortex M4）开发板的开发工程源码包         |
+|            | qemu-virt-a53            |                      | Coretex A53的qemu开发工程源码包                              |
+|            | realview-pbx-a9          |                      | Coretex A9的qemu开发工程源码包                               |
+|            | STM32F072_Nucleo         |                      | STM32F072_Nucleo（ARM Cortex M0）开发板的开发工程源码包      |
+|            | STM32F103_FIRE_Arbitrary |                      | 野火STM32F103（ARM Cortex M3）霸道开发板的开发工程源码包     |
+|            | STM32F407_ATK_Explorer   |                      | 正点原子STM32F407（ARM Cortex M4）探索者开发板的开发工程源码包 |
+|            | STM32F769IDISCOVERY      |                      | STM32F769IDISCOVERY（ARM Cortex M7）开发板的开发工程源码包   |
+|            | STM32L431_BearPi         |                      | 小熊派STM32L431（ARM Cortex M4）开发板的开发工程源码包       |
+| tools      | build                    |                      | LiteOS支持的开发板编译配置文件                               |
+|            | menuconfig               |                      | LiteOS编译所需的menuconfig脚本                               |
+| Makefile   |                          |                      | LiteOS Makefile                                              |
+| .config    |                          |                      | 开发板的配置文件，如果用户不重新选择开发板，默认为野火挑战者STM32F429开发板的配置文件 |

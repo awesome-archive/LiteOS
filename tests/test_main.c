@@ -23,16 +23,8 @@
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*/
-/*----------------------------------------------------------------------------
- * Notice of Export Control Law
- * ===============================================
- * Huawei LiteOS may be subject to applicable export control laws and regulations, which might
- * include those applicable to Huawei LiteOS of U.S. and the country in which you are located.
- * Import, export and usage of Huawei LiteOS in any manner by you shall be in compliance with such
- * applicable export control laws and regulations.
- *---------------------------------------------------------------------------*/
 #include "sys_init.h"
-#if defined(WITH_LWIP)
+#if defined(LOSCFG_COMPONENTS_NET_LWIP)
 #include "../../../test_agenttiny/test_agenttiny.h"
 #endif
 
@@ -123,7 +115,7 @@ int demo_cmockery_test(void)
     }
 #endif
 
-#if defined(WITH_LWIP) && (!defined(USE_NB_NEUL95_NO_ATINY))
+#if defined(LOSCFG_COMPONENTS_NET_LWIP) && (!defined(USE_NB_NEUL95_NO_ATINY))
 
     uwRet = creat_agenttiny_test_task();
     if (uwRet != LOS_OK)

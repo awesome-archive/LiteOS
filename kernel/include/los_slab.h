@@ -1,6 +1,8 @@
-/*----------------------------------------------------------------------------
- * Copyright (c) <2013-2015>, <Huawei Technologies Co., Ltd>
- * All rights reserved.
+/* ----------------------------------------------------------------------------
+ * Copyright (c) Huawei Technologies Co., Ltd. 2013-2015. All rights reserved.
+ * Description: LiteOS memory Module Implementation
+ * Author: Huawei LiteOS Team
+ * Create: 2013-05-12
  * Redistribution and use in source and binary forms, with or without modification,
  * are permitted provided that the following conditions are met:
  * 1. Redistributions of source code must retain the above copyright notice, this list of
@@ -22,24 +24,17 @@
  * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *---------------------------------------------------------------------------*/
-/*----------------------------------------------------------------------------
- * Notice of Export Control Law
- * ===============================================
- * Huawei LiteOS may be subject to applicable export control laws and regulations, which might
- * include those applicable to Huawei LiteOS of U.S. and the country in which you are located.
- * Import, export and usage of Huawei LiteOS in any manner by you shall be in compliance with such
- * applicable export control laws and regulations.
- *---------------------------------------------------------------------------*/
+ * --------------------------------------------------------------------------- */
 
-/**@defgroup los_slab Slab
+/**
+ * @defgroup los_slab Slab
  * @ingroup kernel
  */
 
 #ifndef _LOS_SLAB_H
 #define _LOS_SLAB_H
 
-#include <los_typedef.h>
+#include "los_base.h"
 
 #ifdef __cplusplus
 #if __cplusplus
@@ -47,16 +42,44 @@ extern "C" {
 #endif /* __cplusplus */
 #endif /* __cplusplus */
 
-//number of slab class
-#define SLAB_MEM_COUNT              4
-
-//step size of each class
-#define SLAB_MEM_CALSS_STEP_SIZE    0x10
-
-//max size of each class
-#define SLAB_MEM_ALLOCATOR_SIZE     512
+// max size of each class
+#define SLAB_MEM_ALLOCATOR_SIZE     512U
 
 #define SLAB_BASIC_NEED_SIZE        0x1000
+
+#ifdef LOSCFG_KERNEL_MEM_SLAB_AUTO_EXPANSION_MODE
+enum SlabBucketSizeType {
+    SLAB_BUCKET_SIZE_HALF_OF_HEAP    = 0x1UL,   /* a half of heap size slab mem can use */
+    SLAB_BUCKET_SIZE_QUARTER_OF_HEAP,           /* one quarter of heap size slab mem can use */
+    SLAB_BUCKET_SIZE_TYPE_MAX
+};
+
+#define SLAB_MEM_BUCKET_SIZE_TYPE   SLAB_BUCKET_SIZE_HALF_OF_HEAP
+#endif
+
+/**
+ * @ingroup los_slab
+ * @brief configure slab size.
+ *
+ * @par Description:
+ * This API is used to configure slab size.
+ * @attention
+ * <ul>
+ * <li>The function should be called before function LOS_MemInit if necessary.</li>
+ * <li>The function takes effect when LOSCFG_KERNEL_MEM_SLAB_AUTO_EXPANSION_MODE is NO.</li>
+ * </ul>
+ *
+ * @param cfg     [IN] the pointer to slab size config table. Note that the pointer cannot be null.
+ * @param cnt     [IN] slab class size, must be equal to SLAB_MEM_COUNT(the number of slab class).
+ *
+ * @retval None.
+ * @par Dependency:
+ * <ul>
+ * <li>los_slab.h: the header file that contains the API declaration.</li>
+ * </ul>
+ * @since Huawei LiteOS V200R003C00
+ */
+extern VOID LOS_SlabSizeCfg(UINT32 *cfg, UINT32 cnt);
 
 #ifdef __cplusplus
 #if __cplusplus
@@ -64,5 +87,4 @@ extern "C" {
 #endif /* __cplusplus */
 #endif /* __cplusplus */
 
-#endif
-
+#endif /* _LOS_SLAB_H */
